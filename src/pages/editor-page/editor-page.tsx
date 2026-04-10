@@ -1,31 +1,30 @@
-import React, { Suspense, useEffect } from 'react';
-import { useChartDB } from '@/hooks/use-chartdb';
-import { useDialog } from '@/hooks/use-dialog';
-import { Toaster } from '@/components/toast/toaster';
-import { useBreakpoint } from '@/hooks/use-breakpoint';
-import { useLocalConfig } from '@/hooks/use-local-config';
-import { FullScreenLoaderProvider } from '@/context/full-screen-spinner-context/full-screen-spinner-provider';
-import { LayoutProvider } from '@/context/layout-context/layout-provider';
-import { LocalConfigProvider } from '@/context/local-config-context/local-config-provider';
-import { StorageProvider } from '@/context/storage-context/storage-provider';
-import { ConfigProvider } from '@/context/config-context/config-provider';
-import { RedoUndoStackProvider } from '@/context/history-context/redo-undo-stack-provider';
-import { ChartDBProvider } from '@/context/chartdb-context/chartdb-provider';
-import { HistoryProvider } from '@/context/history-context/history-provider';
-import { ThemeProvider } from '@/context/theme-context/theme-provider';
-import { ReactFlowProvider } from '@xyflow/react';
-import { ExportImageProvider } from '@/context/export-image-context/export-image-provider';
-import { DialogProvider } from '@/context/dialog-context/dialog-provider';
-import { KeyboardShortcutsProvider } from '@/context/keyboard-shortcuts-context/keyboard-shortcuts-provider';
 import { Spinner } from '@/components/spinner/spinner';
-import { Helmet } from 'react-helmet-async';
+import { Toaster } from '@/components/toast/toaster';
 import { AlertProvider } from '@/context/alert-context/alert-provider';
 import { CanvasProvider } from '@/context/canvas-context/canvas-provider';
-import { HIDE_CHARTDB_CLOUD } from '@/lib/env';
-import { useDiagramLoader } from './use-diagram-loader';
-import { DiffProvider } from '@/context/diff-context/diff-provider';
-import { TopNavbarMock } from './top-navbar/top-navbar-mock';
+import { ChartDBProvider } from '@/context/chartdb-context/chartdb-provider';
+import { ConfigProvider } from '@/context/config-context/config-provider';
 import { DiagramFilterProvider } from '@/context/diagram-filter-context/diagram-filter-provider';
+import { DialogProvider } from '@/context/dialog-context/dialog-provider';
+import { DiffProvider } from '@/context/diff-context/diff-provider';
+import { ExportImageProvider } from '@/context/export-image-context/export-image-provider';
+import { FullScreenLoaderProvider } from '@/context/full-screen-spinner-context/full-screen-spinner-provider';
+import { HistoryProvider } from '@/context/history-context/history-provider';
+import { RedoUndoStackProvider } from '@/context/history-context/redo-undo-stack-provider';
+import { KeyboardShortcutsProvider } from '@/context/keyboard-shortcuts-context/keyboard-shortcuts-provider';
+import { LayoutProvider } from '@/context/layout-context/layout-provider';
+import { LocalConfigProvider } from '@/context/local-config-context/local-config-provider';
+import { ThemeProvider } from '@/context/theme-context/theme-provider';
+import { useBreakpoint } from '@/hooks/use-breakpoint';
+import { useChartDB } from '@/hooks/use-chartdb';
+import { useDialog } from '@/hooks/use-dialog';
+import { useLocalConfig } from '@/hooks/use-local-config';
+import { HIDE_CHARTDB_CLOUD } from '@/lib/env';
+import { ReactFlowProvider } from '@xyflow/react';
+import React, { Suspense, useEffect } from 'react';
+import { Helmet } from 'react-helmet-async';
+import { TopNavbarMock } from './top-navbar/top-navbar-mock';
+import { useDiagramLoader } from './use-diagram-loader';
 
 const OPEN_STAR_US_AFTER_SECONDS = 30;
 const SHOW_STAR_US_AGAIN_AFTER_DAYS = 1;
@@ -116,33 +115,31 @@ export const EditorPage: React.FC = () => (
         <ThemeProvider>
             <FullScreenLoaderProvider>
                 <LayoutProvider>
-                    <StorageProvider>
-                        <ConfigProvider>
-                            <RedoUndoStackProvider>
-                                <DiffProvider>
-                                    <ChartDBProvider>
-                                        <DiagramFilterProvider>
-                                            <HistoryProvider>
-                                                <ReactFlowProvider>
-                                                    <CanvasProvider>
-                                                        <ExportImageProvider>
-                                                            <AlertProvider>
-                                                                <DialogProvider>
-                                                                    <KeyboardShortcutsProvider>
-                                                                        <EditorPageComponent />
-                                                                    </KeyboardShortcutsProvider>
-                                                                </DialogProvider>
-                                                            </AlertProvider>
-                                                        </ExportImageProvider>
-                                                    </CanvasProvider>
-                                                </ReactFlowProvider>
-                                            </HistoryProvider>
-                                        </DiagramFilterProvider>
-                                    </ChartDBProvider>
-                                </DiffProvider>
-                            </RedoUndoStackProvider>
-                        </ConfigProvider>
-                    </StorageProvider>
+                    <ConfigProvider>
+                        <RedoUndoStackProvider>
+                            <DiffProvider>
+                                <ChartDBProvider>
+                                    <DiagramFilterProvider>
+                                        <HistoryProvider>
+                                            <ReactFlowProvider>
+                                                <CanvasProvider>
+                                                    <ExportImageProvider>
+                                                        <AlertProvider>
+                                                            <DialogProvider>
+                                                                <KeyboardShortcutsProvider>
+                                                                    <EditorPageComponent />
+                                                                </KeyboardShortcutsProvider>
+                                                            </DialogProvider>
+                                                        </AlertProvider>
+                                                    </ExportImageProvider>
+                                                </CanvasProvider>
+                                            </ReactFlowProvider>
+                                        </HistoryProvider>
+                                    </DiagramFilterProvider>
+                                </ChartDBProvider>
+                            </DiffProvider>
+                        </RedoUndoStackProvider>
+                    </ConfigProvider>
                 </LayoutProvider>
             </FullScreenLoaderProvider>
         </ThemeProvider>

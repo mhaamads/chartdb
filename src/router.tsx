@@ -1,11 +1,12 @@
 import React from 'react';
 import type { RouteObject } from 'react-router-dom';
 import { createBrowserRouter } from 'react-router-dom';
+import { ProtectedRoute } from './components/protected-route/protected-route';
 import type { TemplatePageLoaderData } from './pages/template-page/template-page';
 import type { TemplatesPageLoaderData } from './pages/templates-page/templates-page';
 import { getTemplatesAndAllTags } from './templates-data/template-utils';
 
-const routes: RouteObject[] = [
+const protectedRoutes: RouteObject[] = [
     ...['', 'diagrams/:diagramId'].map((path) => ({
         path,
         async lazy() {
@@ -138,6 +139,20 @@ const routes: RouteObject[] = [
                 element: <NotFoundPage />,
             };
         },
+    },
+];
+
+const routes: RouteObject[] = [
+    {
+        path: 'auth',
+        async lazy() {
+            const { AuthPage } = await import('./pages/auth-page/auth-page');
+            return { element: <AuthPage /> };
+        },
+    },
+    {
+        element: <ProtectedRoute />,
+        children: protectedRoutes,
     },
 ];
 

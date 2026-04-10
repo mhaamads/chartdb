@@ -1,16 +1,25 @@
-import React, { useCallback } from 'react';
-import ChartDBLogo from '@/assets/logo-light.png';
 import ChartDBDarkLogo from '@/assets/logo-dark.png';
+import ChartDBLogo from '@/assets/logo-light.png';
+import { Button } from '@/components/button/button';
+import {
+    Tooltip,
+    TooltipContent,
+    TooltipTrigger,
+} from '@/components/tooltip/tooltip';
+import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
+import { LogOut } from 'lucide-react';
+import React, { useCallback } from 'react';
 import { DiagramName } from './diagram-name';
-import { LastSaved } from './last-saved';
 import { LanguageNav } from './language-nav/language-nav';
+import { LastSaved } from './last-saved';
 import { Menu } from './menu/menu';
 
 export interface TopNavbarProps {}
 
 export const TopNavbar: React.FC<TopNavbarProps> = () => {
     const { effectiveTheme } = useTheme();
+    const { signOut, user } = useAuth();
 
     const renderStars = useCallback(() => {
         return (
@@ -50,6 +59,21 @@ export const TopNavbar: React.FC<TopNavbarProps> = () => {
                 <LastSaved />
                 {renderStars()}
                 <LanguageNav />
+                {user && (
+                    <Tooltip>
+                        <TooltipTrigger asChild>
+                            <Button
+                                variant="ghost"
+                                size="icon"
+                                onClick={() => signOut()}
+                                aria-label="Sign out"
+                            >
+                                <LogOut className="size-4" />
+                            </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>Sign out ({user.email})</TooltipContent>
+                    </Tooltip>
+                )}
             </div>
         </nav>
     );
