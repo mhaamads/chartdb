@@ -1,4 +1,4 @@
-import React, { useCallback } from 'react';
+import { Button } from '@/components/button/button';
 import {
     DropdownMenu,
     DropdownMenuContent,
@@ -6,12 +6,12 @@ import {
     DropdownMenuSeparator,
     DropdownMenuTrigger,
 } from '@/components/dropdown-menu/dropdown-menu';
-import { Button } from '@/components/button/button';
-import { Ellipsis, Layers2, SquareArrowOutUpRight, Trash2 } from 'lucide-react';
 import { useChartDB } from '@/hooks/use-chartdb';
-import type { Diagram } from '@/lib/domain';
 import { useStorage } from '@/hooks/use-storage';
 import { cloneDiagram } from '@/lib/clone';
+import type { Diagram } from '@/lib/domain';
+import { Ellipsis, Layers2, SquareArrowOutUpRight, Trash2 } from 'lucide-react';
+import React, { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 
 interface DiagramRowActionsMenuProps {
@@ -32,7 +32,7 @@ export const DiagramRowActionsMenu: React.FC<DiagramRowActionsMenuProps> = ({
     const { t } = useTranslation();
 
     const onDelete = useCallback(async () => {
-        deleteDiagram(diagram.id);
+        await deleteDiagram(diagram.id);
         refetch();
 
         if (diagram.id === diagramId || numberOfDiagrams <= 1) {
@@ -51,7 +51,7 @@ export const DiagramRowActionsMenu: React.FC<DiagramRowActionsMenuProps> = ({
 
         diagramToAdd.name = `${diagram.name} (Copy)`;
 
-        addDiagram({ diagram: diagramToAdd });
+        await addDiagram({ diagram: diagramToAdd });
         refetch();
     }, [addDiagram, refetch, diagram]);
 

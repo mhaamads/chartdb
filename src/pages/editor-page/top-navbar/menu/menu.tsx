@@ -1,4 +1,3 @@
-import React, { useCallback } from 'react';
 import {
     Menubar,
     MenubarCheckboxItem,
@@ -12,22 +11,23 @@ import {
     MenubarSubTrigger,
     MenubarTrigger,
 } from '@/components/menubar/menubar';
-import { useChartDB } from '@/hooks/use-chartdb';
-import { useDialog } from '@/hooks/use-dialog';
-import { useExportImage } from '@/hooks/use-export-image';
-import { databaseTypeToLabelMap } from '@/lib/databases';
-import { DatabaseType } from '@/lib/domain/database-type';
+import { useAlert } from '@/context/alert-context/alert-context';
 import {
     KeyboardShortcutAction,
     keyboardShortcutsForOS,
 } from '@/context/keyboard-shortcuts-context/keyboard-shortcuts';
+import { useChartDB } from '@/hooks/use-chartdb';
+import { useDialog } from '@/hooks/use-dialog';
+import { useExportImage } from '@/hooks/use-export-image';
 import { useHistory } from '@/hooks/use-history';
-import { useTranslation } from 'react-i18next';
 import { useLayout } from '@/hooks/use-layout';
-import { useTheme } from '@/hooks/use-theme';
 import { useLocalConfig } from '@/hooks/use-local-config';
+import { useTheme } from '@/hooks/use-theme';
+import { databaseTypeToLabelMap } from '@/lib/databases';
+import { DatabaseType } from '@/lib/domain/database-type';
+import React, { useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { useAlert } from '@/context/alert-context/alert-context';
 
 export interface MenuProps {}
 
@@ -67,8 +67,8 @@ export const Menu: React.FC<MenuProps> = () => {
     const { exportImage } = useExportImage();
     const navigate = useNavigate();
 
-    const handleDeleteDiagramAction = useCallback(() => {
-        deleteDiagram();
+    const handleDeleteDiagramAction = useCallback(async () => {
+        await deleteDiagram();
         navigate('/');
     }, [deleteDiagram, navigate]);
 

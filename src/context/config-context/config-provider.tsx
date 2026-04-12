@@ -23,25 +23,15 @@ export const ConfigProvider: React.FC<React.PropsWithChildren> = ({
         config,
         updateFn,
     }) => {
-        const promise = new Promise<void>((resolve) => {
-            setConfig((prevConfig) => {
-                let baseConfig: ChartDBConfig = { defaultDiagramId: '' };
-                if (prevConfig) {
-                    baseConfig = prevConfig;
-                }
+        let baseConfig: ChartDBConfig = { defaultDiagramId: '' };
+        const prevConfig = config;
 
-                const updatedConfig = updateFn
-                    ? updateFn(baseConfig)
-                    : { ...baseConfig, ...config };
+        const updatedConfig = updateFn
+            ? updateFn(baseConfig)
+            : { ...baseConfig, ...config };
 
-                updateDataConfig(updatedConfig).then(() => {
-                    resolve();
-                });
-                return updatedConfig;
-            });
-        });
-
-        return promise;
+        setConfig(updatedConfig);
+        await updateDataConfig(updatedConfig);
     };
 
     return (

@@ -1,4 +1,3 @@
-import React, { useCallback } from 'react';
 import {
     AlertDialog,
     AlertDialogAction,
@@ -9,15 +8,16 @@ import {
     AlertDialogHeader,
     AlertDialogTitle,
 } from '@/components/alert-dialog/alert-dialog';
-import type { AlertDialogProps } from '@radix-ui/react-alert-dialog';
 import { useAlert } from '@/context/alert-context/alert-context';
+import type { AlertDialogProps } from '@radix-ui/react-alert-dialog';
+import React, { useCallback } from 'react';
 
 export interface BaseAlertDialogProps {
     title: string;
     description?: string;
     actionLabel?: string;
     closeLabel?: string;
-    onAction?: () => void;
+    onAction?: () => void | Promise<void>;
     dialog?: AlertDialogProps;
     onClose?: () => void;
     content?: React.ReactNode;
@@ -40,8 +40,8 @@ export const BaseAlertDialog: React.FC<BaseAlertDialogProps> = ({
         closeAlert();
     }, [onClose, closeAlert]);
 
-    const alertHandler = useCallback(() => {
-        onAction?.();
+    const alertHandler = useCallback(async () => {
+        await onAction?.();
         closeAlert();
     }, [onAction, closeAlert]);
     return (
