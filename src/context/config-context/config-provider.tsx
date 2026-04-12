@@ -24,8 +24,6 @@ export const ConfigProvider: React.FC<React.PropsWithChildren> = ({
         updateFn,
     }) => {
         let baseConfig: ChartDBConfig = { defaultDiagramId: '' };
-        const prevConfig = config;
-
         const updatedConfig = updateFn
             ? updateFn(baseConfig)
             : { ...baseConfig, ...config };
