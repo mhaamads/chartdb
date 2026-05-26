@@ -66,6 +66,10 @@ export interface DialogContext {
         params: Omit<ImportDiagramDialogProps, 'dialog'>
     ) => void;
     closeImportDiagramDialog: () => void;
+
+    // AI assistant settings dialog
+    openAISettingsDialog: () => void;
+    closeAISettingsDialog: () => void;
 }
 
 export const dialogContext = createContext<DialogContext>({
@@ -89,4 +93,6 @@ export const dialogContext = createContext<DialogContext>({
     closeExportDiagramDialog: emptyFn,
     openImportDiagramDialog: emptyFn,
     closeImportDiagramDialog: emptyFn,
+    openAISettingsDialog: emptyFn,
+    closeAISettingsDialog: emptyFn,
 });

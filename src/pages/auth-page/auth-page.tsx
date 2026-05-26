@@ -33,9 +33,7 @@ export const AuthPage: React.FC = () => {
                 setInfo('Password reset email sent. Check your inbox.');
             }
         } catch (err: unknown) {
-            const message =
-                err instanceof Error ? err.message : 'An error occurred.';
-            setError(friendlyFirebaseMessage(message));
+            setError(friendlyFirebaseMessage(err));
         } finally {
             setLoading(false);
         }
@@ -138,20 +136,42 @@ export const AuthPage: React.FC = () => {
     );
 };
 
-/** Convert Firebase error codes into friendlier messages. */
-function friendlyFirebaseMessage(message: string): string {
+/**
+ * Convert Firebase errors into user-friendly messages.
+ *
+ * Prefers `FirebaseError.code` (stable identifier) over `.message`, which is
+ * a free-form English string Firebase can change between SDK versions.
+ */
+function friendlyFirebaseMessage(err: unknown): string {
+    const code =
+        typeof err === 'object' &&
+        err !== null &&
+        'code' in err &&
+        typeof (err as { code: unknown }).code === 'string'
+            ? (err as { code: string }).code
+            : '';
+    const message =
+        err instanceof Error ? err.message : 'An unexpected error occurred.';
+    const haystack = `${code} ${message}`;
+
     if (
-        message.includes('invalid-credential') ||
-        message.includes('wrong-password') ||
-        message.includes('user-not-found')
+        haystack.includes('invalid-credential') ||
+        haystack.includes('wrong-password') ||
+        haystack.includes('user-not-found')
     ) {
         return 'Invalid email or password.';
     }
-    if (message.includes('invalid-email')) {
+    if (haystack.includes('invalid-email')) {
         return 'Please enter a valid email address.';
     }
-    if (message.includes('too-many-requests')) {
+    if (haystack.includes('too-many-requests')) {
         return 'Too many attempts. Please try again later.';
+    }
+    if (haystack.includes('user-disabled')) {
+        return 'This account has been disabled.';
+    }
+    if (haystack.includes('network-request-failed')) {
+        return 'Network error. Check your connection and try again.';
     }
     return message;
 }

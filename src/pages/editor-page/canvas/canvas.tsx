@@ -177,7 +177,10 @@ const tableToTableNode = (
     }
 ): TableNodeType => {
     // Always use absolute position for now
-    const position = { x: table.x, y: table.y };
+    const position = {
+        x: isFinite(table.x) ? table.x : 0,
+        y: isFinite(table.y) ? table.y : 0,
+    };
 
     let hidden = false;
 
@@ -242,7 +245,10 @@ const areaToAreaNode = (
     return {
         id: area.id,
         type: 'area',
-        position: { x: area.x, y: area.y },
+        position: {
+            x: isFinite(area.x) ? area.x : 0,
+            y: isFinite(area.y) ? area.y : 0,
+        },
         data: { area },
         width: area.width,
         height: area.height,
@@ -258,7 +264,10 @@ const noteToNoteNode = (note: Note): NoteNodeType => {
     return {
         id: note.id,
         type: 'note',
-        position: { x: note.x, y: note.y },
+        position: {
+            x: isFinite(note.x) ? note.x : 0,
+            y: isFinite(note.y) ? note.y : 0,
+        },
         data: { note },
         width: note.width,
         height: note.height,

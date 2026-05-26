@@ -1,6 +1,10 @@
 import { Spinner } from '@/components/spinner/spinner';
 import { Toaster } from '@/components/toast/toaster';
 import { AlertProvider } from '@/context/alert-context/alert-provider';
+import { AIConfigProvider } from '@/context/ai-config-context/ai-config-provider';
+import { AIChatProvider } from '@/context/ai-chat-context/ai-chat-provider';
+import { AIChatPanelControlProvider } from '@/dialogs/ai-chat-panel/ai-chat-panel-control-provider';
+import { AIChatPanel } from '@/dialogs/ai-chat-panel/ai-chat-panel';
 import { CanvasProvider } from '@/context/canvas-context/canvas-provider';
 import { ChartDBProvider } from '@/context/chartdb-context/chartdb-provider';
 import { ConfigProvider } from '@/context/config-context/config-provider';
@@ -113,35 +117,42 @@ const EditorPageComponent: React.FC = () => {
 export const EditorPage: React.FC = () => (
     <LocalConfigProvider>
         <ThemeProvider>
-            <FullScreenLoaderProvider>
-                <LayoutProvider>
-                    <ConfigProvider>
-                        <RedoUndoStackProvider>
-                            <DiffProvider>
-                                <ChartDBProvider>
-                                    <DiagramFilterProvider>
-                                        <HistoryProvider>
-                                            <ReactFlowProvider>
-                                                <CanvasProvider>
-                                                    <ExportImageProvider>
-                                                        <AlertProvider>
-                                                            <DialogProvider>
-                                                                <KeyboardShortcutsProvider>
-                                                                    <EditorPageComponent />
-                                                                </KeyboardShortcutsProvider>
-                                                            </DialogProvider>
-                                                        </AlertProvider>
-                                                    </ExportImageProvider>
-                                                </CanvasProvider>
-                                            </ReactFlowProvider>
-                                        </HistoryProvider>
-                                    </DiagramFilterProvider>
-                                </ChartDBProvider>
-                            </DiffProvider>
-                        </RedoUndoStackProvider>
-                    </ConfigProvider>
-                </LayoutProvider>
-            </FullScreenLoaderProvider>
+            <AIConfigProvider>
+                <FullScreenLoaderProvider>
+                    <LayoutProvider>
+                        <ConfigProvider>
+                            <RedoUndoStackProvider>
+                                <DiffProvider>
+                                    <ChartDBProvider>
+                                        <DiagramFilterProvider>
+                                            <HistoryProvider>
+                                                <ReactFlowProvider>
+                                                    <CanvasProvider>
+                                                        <ExportImageProvider>
+                                                            <AlertProvider>
+                                                                <DialogProvider>
+                                                                    <AIChatProvider>
+                                                                        <AIChatPanelControlProvider>
+                                                                            <KeyboardShortcutsProvider>
+                                                                                <EditorPageComponent />
+                                                                                <AIChatPanel />
+                                                                            </KeyboardShortcutsProvider>
+                                                                        </AIChatPanelControlProvider>
+                                                                    </AIChatProvider>
+                                                                </DialogProvider>
+                                                            </AlertProvider>
+                                                        </ExportImageProvider>
+                                                    </CanvasProvider>
+                                                </ReactFlowProvider>
+                                            </HistoryProvider>
+                                        </DiagramFilterProvider>
+                                    </ChartDBProvider>
+                                </DiffProvider>
+                            </RedoUndoStackProvider>
+                        </ConfigProvider>
+                    </LayoutProvider>
+                </FullScreenLoaderProvider>
+            </AIConfigProvider>
         </ThemeProvider>
     </LocalConfigProvider>
 );

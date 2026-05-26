@@ -20,13 +20,16 @@ export const ConfigProvider: React.FC<React.PropsWithChildren> = ({
     }, [getConfig]);
 
     const updateConfig: ConfigContext['updateConfig'] = async ({
-        config,
+        config: partialConfig,
         updateFn,
     }) => {
-        let baseConfig: ChartDBConfig = { defaultDiagramId: '' };
+        // Use the current config as the base so partial updates don't wipe
+        // out other fields. Falls back to an empty default if config hasn't
+        // loaded yet.
+        const baseConfig: ChartDBConfig = config ?? { defaultDiagramId: '' };
         const updatedConfig = updateFn
             ? updateFn(baseConfig)
-            : { ...baseConfig, ...config };
+            : { ...baseConfig, ...partialConfig };
 
         setConfig(updatedConfig);
         await updateDataConfig(updatedConfig);

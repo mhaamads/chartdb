@@ -8,18 +8,21 @@ import {
 } from '@/components/tooltip/tooltip';
 import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
-import { LogOut } from 'lucide-react';
+import { useAIChatPanel } from '@/dialogs/ai-chat-panel/use-ai-chat-panel';
+import { LogOut, Sparkles } from 'lucide-react';
 import React, { useCallback } from 'react';
 import { DiagramName } from './diagram-name';
 import { LanguageNav } from './language-nav/language-nav';
 import { LastSaved } from './last-saved';
 import { Menu } from './menu/menu';
+import { SyncStatusIndicator } from './sync-status-indicator';
 
 export interface TopNavbarProps {}
 
 export const TopNavbar: React.FC<TopNavbarProps> = () => {
     const { effectiveTheme } = useTheme();
     const { signOut, user } = useAuth();
+    const { toggle: toggleAIChatPanel } = useAIChatPanel();
 
     const renderStars = useCallback(() => {
         return (
@@ -57,6 +60,20 @@ export const TopNavbar: React.FC<TopNavbarProps> = () => {
             <DiagramName />
             <div className="hidden flex-1 items-center justify-end gap-2 sm:flex">
                 <LastSaved />
+                {user && <SyncStatusIndicator />}
+                <Tooltip>
+                    <TooltipTrigger asChild>
+                        <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={toggleAIChatPanel}
+                            aria-label="Open AI assistant"
+                        >
+                            <Sparkles className="size-4 text-amber-500" />
+                        </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>AI assistant</TooltipContent>
+                </Tooltip>
                 {renderStars()}
                 <LanguageNav />
                 {user && (

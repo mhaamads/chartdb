@@ -18,7 +18,9 @@ import {
     Timestamp,
     updateDoc,
     writeBatch,
+    type WriteBatch,
 } from 'firebase/firestore';
+import { FirebaseError } from 'firebase/app';
 import React, { useCallback, useMemo } from 'react';
 import type { StorageContext } from './storage-context';
 import { storageContext } from './storage-context';
@@ -27,30 +29,100 @@ import { storageContext } from './storage-context';
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Max operations per Firestore batch. */
-const BATCH_LIMIT = 499;
+/**
+ * Firestore's hard limit is 500 writes per batch.
+ */
+const BATCH_LIMIT = 500;
+
+/** Maximum number of retry attempts for transient Firestore errors. */
+const MAX_RETRIES = 4;
+
+/** Firestore error codes that are safe to retry. */
+const RETRYABLE_CODES = new Set([
+    'unavailable',
+    'deadline-exceeded',
+    'internal',
+    'aborted',
+    'cancelled',
+    'resource-exhausted',
+    'unknown',
+]);
+
+function isRetryableFirestoreError(err: unknown): boolean {
+    if (err instanceof FirebaseError) {
+        // FirebaseError codes can be prefixed (`firestore/unavailable`) or
+        // bare (`unavailable`). Normalize before checking.
+        const code = err.code.includes('/') ? err.code.split('/')[1] : err.code;
+        return RETRYABLE_CODES.has(code);
+    }
+    return false;
+}
 
 /**
- * Strip `undefined` values so Firestore doesn't throw, while preserving
- * Date objects (unlike JSON.parse(JSON.stringify()) which corrupts them).
+ * Run a Firestore write operation with exponential backoff on transient
+ * errors. Non-retryable errors (permission-denied, invalid-argument,
+ * failed-precondition, …) propagate immediately so callers can react.
  */
-function stripUndefined<T extends object>(obj: T): T {
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(obj)) {
-        if (value === undefined) continue;
-        if (
-            value !== null &&
-            typeof value === 'object' &&
-            !Array.isArray(value) &&
-            !(value instanceof Date) &&
-            !(value instanceof Timestamp)
-        ) {
-            result[key] = stripUndefined(value as Record<string, unknown>);
-        } else {
-            result[key] = value;
+async function withRetry<T>(
+    operation: () => Promise<T>,
+    label: string
+): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            return await operation();
+        } catch (err) {
+            lastError = err;
+            if (!isRetryableFirestoreError(err) || attempt === MAX_RETRIES) {
+                break;
+            }
+            // Exponential backoff with jitter: 100, 250, 600, 1300ms (±25%)
+            const base = 100 * Math.pow(2.2, attempt);
+            const delay = base * (0.75 + Math.random() * 0.5);
+            console.warn(
+                `[firestore] ${label} failed (attempt ${attempt + 1}/${
+                    MAX_RETRIES + 1
+                }), retrying in ${Math.round(delay)}ms`,
+                err
+            );
+            await new Promise((resolve) => setTimeout(resolve, delay));
         }
     }
-    return result as T;
+    throw lastError;
+}
+
+/** Commit a batch with retry-on-transient-error semantics. */
+function commitBatch(batch: WriteBatch, label: string): Promise<void> {
+    return withRetry(() => batch.commit(), label);
+}
+
+/**
+ * Recursively strip `undefined` values from objects and any nested objects
+ * inside arrays. Preserves `Date` and `Timestamp` instances (unlike
+ * `JSON.parse(JSON.stringify(...))`, which corrupts dates).
+ *
+ * Even though Firestore is configured with `ignoreUndefinedProperties: true`
+ * (see `firebase-firestore.ts`), `undefined` ARRAY ELEMENTS still throw at
+ * the SDK layer (the option only ignores undefined object properties).
+ * This helper handles that case and keeps persisted docs minimal.
+ */
+function stripUndefined<T>(value: T): T {
+    if (value === undefined || value === null) return value;
+    if (value instanceof Date || value instanceof Timestamp) return value;
+    if (Array.isArray(value)) {
+        return value
+            .filter((v) => v !== undefined)
+            .map((v) => stripUndefined(v)) as unknown as T;
+    }
+    if (typeof value === 'object') {
+        const result: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+            if (v === undefined) continue;
+            result[k] = stripUndefined(v);
+        }
+        return result as T;
+    }
+    return value;
 }
 
 /** Convert any Firestore Timestamp fields to JS Date recursively. */
@@ -79,7 +151,7 @@ async function deleteCollection(collectionPath: string): Promise<void> {
     for (let i = 0; i < docs.length; i += BATCH_LIMIT) {
         const batch = writeBatch(firestore);
         docs.slice(i, i + BATCH_LIMIT).forEach((d) => batch.delete(d.ref));
-        await batch.commit();
+        await commitBatch(batch, `deleteCollection(${collectionPath})`);
     }
 }
 
@@ -105,6 +177,60 @@ const SUB_COLLECTIONS = [
     'notes',
     'diagram_filters',
 ] as const;
+
+/**
+ * Update an entity (table/relationship/dependency/area/customType/note) by
+ * id without knowing its parent diagram up-front.
+ *
+ * Strategy: check the user's default diagram first (the overwhelmingly
+ * common case), then fall back to scanning all diagrams. This is a
+ * compatibility shim for `StorageContext.updateXxx` signatures that don't
+ * accept a `diagramId`. The diagrams collection is small in practice
+ * (typically <100 docs per user), so the worst-case fan-out is bounded.
+ *
+ * Logs a warning if the entity isn't found anywhere \u2014 silent no-ops are
+ * notoriously hard to debug.
+ */
+async function updateEntityById(
+    uid: string,
+    collectionName: (typeof SUB_COLLECTIONS)[number],
+    entityId: string,
+    attributes: object,
+    label: string
+): Promise<void> {
+    const configSnap = await getDoc(doc(firestore, configDocPath(uid)));
+    const defaultId = configSnap.exists()
+        ? (configSnap.data() as ChartDBConfig).defaultDiagramId
+        : undefined;
+
+    const tryUpdate = async (diagramId: string): Promise<boolean> => {
+        const ref = doc(
+            firestore,
+            subCol(uid, diagramId, collectionName),
+            entityId
+        );
+        const snap = await getDoc(ref);
+        if (!snap.exists()) return false;
+        await withRetry(
+            () => updateDoc(ref, stripUndefined(attributes)),
+            `${label}(${entityId}) in ${diagramId}`
+        );
+        return true;
+    };
+
+    if (defaultId && (await tryUpdate(defaultId))) return;
+
+    const snap = await getDocs(collection(firestore, diagramsCol(uid)));
+    for (const diagramSnap of snap.docs) {
+        if (diagramSnap.id === defaultId) continue;
+        if (await tryUpdate(diagramSnap.id)) return;
+    }
+
+    console.warn(
+        `[firestore] ${label}: entity "${entityId}" not found in any diagram; ` +
+            `update was a no-op.`
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -209,41 +335,13 @@ export const FirestoreStorageProvider: React.FC<
 
     const updateTable: StorageContext['updateTable'] = useCallback(
         async ({ id, attributes }) => {
-            // The interface doesn't pass diagramId. Retrieve it from config's
-            // current diagram, falling back to searching all diagrams.
-            const configSnap = await getDoc(doc(firestore, configDocPath(uid)));
-            const defaultId = configSnap.exists()
-                ? (configSnap.data() as ChartDBConfig).defaultDiagramId
-                : undefined;
-
-            if (defaultId) {
-                const tableRef = doc(
-                    firestore,
-                    subCol(uid, defaultId, 'db_tables'),
-                    id
-                );
-                const tableSnap = await getDoc(tableRef);
-                if (tableSnap.exists()) {
-                    await updateDoc(tableRef, stripUndefined(attributes));
-                    return;
-                }
-            }
-
-            // Fallback: search all diagrams
-            const snap = await getDocs(collection(firestore, diagramsCol(uid)));
-            for (const diagramSnap of snap.docs) {
-                if (diagramSnap.id === defaultId) continue; // already checked
-                const tableRef = doc(
-                    firestore,
-                    subCol(uid, diagramSnap.id, 'db_tables'),
-                    id
-                );
-                const tableSnap = await getDoc(tableRef);
-                if (tableSnap.exists()) {
-                    await updateDoc(tableRef, stripUndefined(attributes));
-                    return;
-                }
-            }
+            await updateEntityById(
+                uid,
+                'db_tables',
+                id,
+                attributes,
+                'updateTable'
+            );
         },
         [uid]
     );
@@ -320,42 +418,13 @@ export const FirestoreStorageProvider: React.FC<
     const updateRelationship: StorageContext['updateRelationship'] =
         useCallback(
             async ({ id, attributes }) => {
-                const configSnap = await getDoc(
-                    doc(firestore, configDocPath(uid))
+                await updateEntityById(
+                    uid,
+                    'db_relationships',
+                    id,
+                    attributes,
+                    'updateRelationship'
                 );
-                const defaultId = configSnap.exists()
-                    ? (configSnap.data() as ChartDBConfig).defaultDiagramId
-                    : undefined;
-
-                if (defaultId) {
-                    const relRef = doc(
-                        firestore,
-                        subCol(uid, defaultId, 'db_relationships'),
-                        id
-                    );
-                    const relSnap = await getDoc(relRef);
-                    if (relSnap.exists()) {
-                        await updateDoc(relRef, stripUndefined(attributes));
-                        return;
-                    }
-                }
-
-                const snap = await getDocs(
-                    collection(firestore, diagramsCol(uid))
-                );
-                for (const diagramSnap of snap.docs) {
-                    if (diagramSnap.id === defaultId) continue;
-                    const relRef = doc(
-                        firestore,
-                        subCol(uid, diagramSnap.id, 'db_relationships'),
-                        id
-                    );
-                    const relSnap = await getDoc(relRef);
-                    if (relSnap.exists()) {
-                        await updateDoc(relRef, stripUndefined(attributes));
-                        return;
-                    }
-                }
             },
             [uid]
         );
@@ -431,38 +500,13 @@ export const FirestoreStorageProvider: React.FC<
 
     const updateDependency: StorageContext['updateDependency'] = useCallback(
         async ({ id, attributes }) => {
-            const configSnap = await getDoc(doc(firestore, configDocPath(uid)));
-            const defaultId = configSnap.exists()
-                ? (configSnap.data() as ChartDBConfig).defaultDiagramId
-                : undefined;
-
-            if (defaultId) {
-                const depRef = doc(
-                    firestore,
-                    subCol(uid, defaultId, 'db_dependencies'),
-                    id
-                );
-                const depSnap = await getDoc(depRef);
-                if (depSnap.exists()) {
-                    await updateDoc(depRef, stripUndefined(attributes));
-                    return;
-                }
-            }
-
-            const snap = await getDocs(collection(firestore, diagramsCol(uid)));
-            for (const diagramSnap of snap.docs) {
-                if (diagramSnap.id === defaultId) continue;
-                const depRef = doc(
-                    firestore,
-                    subCol(uid, diagramSnap.id, 'db_dependencies'),
-                    id
-                );
-                const depSnap = await getDoc(depRef);
-                if (depSnap.exists()) {
-                    await updateDoc(depRef, stripUndefined(attributes));
-                    return;
-                }
-            }
+            await updateEntityById(
+                uid,
+                'db_dependencies',
+                id,
+                attributes,
+                'updateDependency'
+            );
         },
         [uid]
     );
@@ -526,38 +570,7 @@ export const FirestoreStorageProvider: React.FC<
 
     const updateArea: StorageContext['updateArea'] = useCallback(
         async ({ id, attributes }) => {
-            const configSnap = await getDoc(doc(firestore, configDocPath(uid)));
-            const defaultId = configSnap.exists()
-                ? (configSnap.data() as ChartDBConfig).defaultDiagramId
-                : undefined;
-
-            if (defaultId) {
-                const areaRef = doc(
-                    firestore,
-                    subCol(uid, defaultId, 'areas'),
-                    id
-                );
-                const areaSnap = await getDoc(areaRef);
-                if (areaSnap.exists()) {
-                    await updateDoc(areaRef, stripUndefined(attributes));
-                    return;
-                }
-            }
-
-            const snap = await getDocs(collection(firestore, diagramsCol(uid)));
-            for (const diagramSnap of snap.docs) {
-                if (diagramSnap.id === defaultId) continue;
-                const areaRef = doc(
-                    firestore,
-                    subCol(uid, diagramSnap.id, 'areas'),
-                    id
-                );
-                const areaSnap = await getDoc(areaRef);
-                if (areaSnap.exists()) {
-                    await updateDoc(areaRef, stripUndefined(attributes));
-                    return;
-                }
-            }
+            await updateEntityById(uid, 'areas', id, attributes, 'updateArea');
         },
         [uid]
     );
@@ -621,38 +634,13 @@ export const FirestoreStorageProvider: React.FC<
 
     const updateCustomType: StorageContext['updateCustomType'] = useCallback(
         async ({ id, attributes }) => {
-            const configSnap = await getDoc(doc(firestore, configDocPath(uid)));
-            const defaultId = configSnap.exists()
-                ? (configSnap.data() as ChartDBConfig).defaultDiagramId
-                : undefined;
-
-            if (defaultId) {
-                const ctRef = doc(
-                    firestore,
-                    subCol(uid, defaultId, 'db_custom_types'),
-                    id
-                );
-                const ctSnap = await getDoc(ctRef);
-                if (ctSnap.exists()) {
-                    await updateDoc(ctRef, stripUndefined(attributes));
-                    return;
-                }
-            }
-
-            const snap = await getDocs(collection(firestore, diagramsCol(uid)));
-            for (const diagramSnap of snap.docs) {
-                if (diagramSnap.id === defaultId) continue;
-                const ctRef = doc(
-                    firestore,
-                    subCol(uid, diagramSnap.id, 'db_custom_types'),
-                    id
-                );
-                const ctSnap = await getDoc(ctRef);
-                if (ctSnap.exists()) {
-                    await updateDoc(ctRef, stripUndefined(attributes));
-                    return;
-                }
-            }
+            await updateEntityById(
+                uid,
+                'db_custom_types',
+                id,
+                attributes,
+                'updateCustomType'
+            );
         },
         [uid]
     );
@@ -716,38 +704,7 @@ export const FirestoreStorageProvider: React.FC<
 
     const updateNote: StorageContext['updateNote'] = useCallback(
         async ({ id, attributes }) => {
-            const configSnap = await getDoc(doc(firestore, configDocPath(uid)));
-            const defaultId = configSnap.exists()
-                ? (configSnap.data() as ChartDBConfig).defaultDiagramId
-                : undefined;
-
-            if (defaultId) {
-                const noteRef = doc(
-                    firestore,
-                    subCol(uid, defaultId, 'notes'),
-                    id
-                );
-                const noteSnap = await getDoc(noteRef);
-                if (noteSnap.exists()) {
-                    await updateDoc(noteRef, stripUndefined(attributes));
-                    return;
-                }
-            }
-
-            const snap = await getDocs(collection(firestore, diagramsCol(uid)));
-            for (const diagramSnap of snap.docs) {
-                if (diagramSnap.id === defaultId) continue;
-                const noteRef = doc(
-                    firestore,
-                    subCol(uid, diagramSnap.id, 'notes'),
-                    id
-                );
-                const noteSnap = await getDoc(noteRef);
-                if (noteSnap.exists()) {
-                    await updateDoc(noteRef, stripUndefined(attributes));
-                    return;
-                }
-            }
+            await updateEntityById(uid, 'notes', id, attributes, 'updateNote');
         },
         [uid]
     );
@@ -785,7 +742,15 @@ export const FirestoreStorageProvider: React.FC<
 
     /**
      * Add a full diagram with all sub-entities using batched writes.
-     * Chunks into batches of 499 to respect Firestore's 500-op limit.
+     *
+     * Write ordering is critical for crash-consistency: we write all
+     * sub-entity batches FIRST and the parent diagram doc LAST. This way,
+     * if a sub-entity batch fails partway, the diagram document never
+     * becomes visible in `listDiagrams`, so the caller can safely retry
+     * without leaving an orphaned half-populated diagram in the UI.
+     *
+     * Sub-entity writes use the diagram id + entity id as the doc key, so
+     * retries are idempotent (setDoc overwrites with the same data).
      */
     const addDiagram: StorageContext['addDiagram'] = useCallback(
         async ({ diagram }) => {
@@ -799,7 +764,6 @@ export const FirestoreStorageProvider: React.FC<
                 ...meta
             } = diagram;
 
-            // Collect all ops: [path, data]
             type WriteOp = { path: string; id: string; data: object };
             const ops: WriteOp[] = [];
 
@@ -846,29 +810,31 @@ export const FirestoreStorageProvider: React.FC<
                 })
             );
 
-            // First batch: diagram metadata + first chunk of sub-entities
+            // 1. Write sub-entities first (in 500-op chunks, idempotent).
             for (let i = 0; i < ops.length; i += BATCH_LIMIT) {
                 const batch = writeBatch(firestore);
-                if (i === 0) {
-                    // Include the diagram doc itself in the first batch
-                    batch.set(
-                        doc(firestore, diagramDocPath(uid, diagram.id)),
-                        stripUndefined(meta)
-                    );
-                }
                 ops.slice(i, i + BATCH_LIMIT).forEach((op) => {
                     batch.set(doc(firestore, op.path, op.id), op.data);
                 });
-                await batch.commit();
-            }
-
-            // If no sub-entities, still write the diagram doc
-            if (ops.length === 0) {
-                await setDoc(
-                    doc(firestore, diagramDocPath(uid, diagram.id)),
-                    stripUndefined(meta)
+                await commitBatch(
+                    batch,
+                    `addDiagram(${diagram.id}) batch ${
+                        Math.floor(i / BATCH_LIMIT) + 1
+                    }`
                 );
             }
+
+            // 2. Then write the diagram parent doc last. Until this succeeds
+            //    the diagram is invisible to listDiagrams, making the whole
+            //    operation atomic from the caller's point of view.
+            await withRetry(
+                () =>
+                    setDoc(
+                        doc(firestore, diagramDocPath(uid, diagram.id)),
+                        stripUndefined(meta)
+                    ),
+                `addDiagram(${diagram.id}) meta`
+            );
         },
         [uid]
     );
@@ -997,7 +963,14 @@ export const FirestoreStorageProvider: React.FC<
     const updateDiagram: StorageContext['updateDiagram'] = useCallback(
         async ({ id, attributes }) => {
             if (attributes.id && attributes.id !== id) {
-                // Rename: copy diagram + all sub-collections to new ID
+                // Rename: copy diagram + all sub-collections to new ID.
+                //
+                // Crash-consistency: we copy sub-collections FIRST, then
+                // write the new parent doc, then clean up the old data.
+                // This means at any failure point the user either sees the
+                // old diagram intact (failure before new meta write) or the
+                // new diagram intact (failure during cleanup) — never two
+                // diagrams in an inconsistent state visible together.
                 const oldRef = doc(firestore, diagramDocPath(uid, id));
                 const oldSnap = await getDoc(oldRef);
                 if (!oldSnap.exists()) return;
@@ -1005,12 +978,18 @@ export const FirestoreStorageProvider: React.FC<
                 const newId = attributes.id;
                 const newRef = doc(firestore, diagramDocPath(uid, newId));
 
-                await setDoc(
-                    newRef,
-                    stripUndefined({ ...oldSnap.data(), ...attributes })
-                );
+                // Refuse to overwrite an unrelated existing diagram.
+                const newExisting = await getDoc(newRef);
+                if (newExisting.exists()) {
+                    throw new Error(
+                        `Cannot rename diagram "${id}" to "${newId}": ` +
+                            `target id already exists.`
+                    );
+                }
 
-                // Copy + delete all sub-collections in parallel
+                // 1. Copy sub-collections to new path (without deleting old
+                //    yet) so the operation stays re-runnable on failure.
+                //    Each doc consumes ONE write here (set on new path).
                 await Promise.all(
                     SUB_COLLECTIONS.map(async (colName) => {
                         const oldCol = collection(
@@ -1032,14 +1011,40 @@ export const FirestoreStorageProvider: React.FC<
                                     ),
                                     d.data()
                                 );
-                                batch.delete(d.ref);
                             });
-                            await batch.commit();
+                            await commitBatch(
+                                batch,
+                                `rename(${id}→${newId}) copy ${colName}`
+                            );
                         }
                     })
                 );
 
-                await deleteDoc(oldRef);
+                // 2. Write the new parent doc. Once this succeeds the new
+                //    diagram is visible to listDiagrams.
+                await withRetry(
+                    () =>
+                        setDoc(
+                            newRef,
+                            stripUndefined({
+                                ...oldSnap.data(),
+                                ...attributes,
+                            })
+                        ),
+                    `rename(${id}→${newId}) meta`
+                );
+
+                // 3. Clean up old data. If this fails the new diagram is
+                //    still intact — leftover old docs can be retried later.
+                await Promise.all(
+                    SUB_COLLECTIONS.map((colName) =>
+                        deleteCollection(subCol(uid, id, colName))
+                    )
+                );
+                await withRetry(
+                    () => deleteDoc(oldRef),
+                    `rename(${id}→${newId}) delete old`
+                );
             } else {
                 // Normal update — strip the `id` field to avoid overwriting it
                 const { id: _id, ...rest } = attributes as Partial<Diagram> & {
@@ -1047,9 +1052,13 @@ export const FirestoreStorageProvider: React.FC<
                 };
                 void _id;
                 if (Object.keys(rest).length > 0) {
-                    await updateDoc(
-                        doc(firestore, diagramDocPath(uid, id)),
-                        stripUndefined(rest)
+                    await withRetry(
+                        () =>
+                            updateDoc(
+                                doc(firestore, diagramDocPath(uid, id)),
+                                stripUndefined(rest)
+                            ),
+                        `updateDiagram(${id})`
                     );
                 }
             }
