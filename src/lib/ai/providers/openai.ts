@@ -49,7 +49,10 @@ interface OpenAIChunk {
     usage?: {
         prompt_tokens?: number;
         completion_tokens?: number;
+        /** OpenAI: cached tokens via prompt_tokens_details. */
         prompt_tokens_details?: { cached_tokens?: number };
+        /** DeepSeek: KV-cache hit tokens reported directly on usage. */
+        prompt_cache_hit_tokens?: number;
     };
 }
 
@@ -314,13 +317,17 @@ export async function* streamOpenAICompatible(
             }
 
             if (chunk.usage) {
+                // Normalize across OpenAI (prompt_tokens_details.cached_tokens)
+                // and DeepSeek (prompt_cache_hit_tokens) cache-hit reporting.
+                const cached =
+                    chunk.usage.prompt_tokens_details?.cached_tokens ??
+                    chunk.usage.prompt_cache_hit_tokens;
                 yield {
                     type: 'usage',
                     usage: {
                         inputTokens: chunk.usage.prompt_tokens ?? 0,
                         outputTokens: chunk.usage.completion_tokens ?? 0,
-                        cachedInputTokens:
-                            chunk.usage.prompt_tokens_details?.cached_tokens,
+                        cachedInputTokens: cached,
                     },
                 };
             }

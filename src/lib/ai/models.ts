@@ -111,6 +111,45 @@ export const AI_MODELS: AIModel[] = [
         outputCostPer1M: 2.5,
         description: 'Fast tier — best balance of cost and capability.',
     },
+    // --- DeepSeek ------------------------------------------------------
+    // DeepSeek API is OpenAI-compatible. Prices are per 1M tokens USD.
+    // https://api-docs.deepseek.com/quick_start/pricing
+    {
+        id: 'deepseek-v4-pro',
+        label: 'DeepSeek V4 Pro',
+        provider: 'deepseek',
+        contextWindow: 1_000_000,
+        maxOutputTokens: 128_000,
+        supportsTools: true,
+        inputCostPer1M: 0.55,
+        outputCostPer1M: 2.19,
+        description:
+            'Latest flagship — strong reasoning, tool use, 1M context.',
+        recommended: true,
+    },
+    {
+        id: 'deepseek-chat',
+        label: 'DeepSeek-V3',
+        provider: 'deepseek',
+        contextWindow: 128_000,
+        maxOutputTokens: 8_192,
+        supportsTools: true,
+        inputCostPer1M: 0.27,
+        outputCostPer1M: 1.1,
+        description: 'Fast, affordable general-purpose model.',
+    },
+    {
+        id: 'deepseek-reasoner',
+        label: 'DeepSeek-R1',
+        provider: 'deepseek',
+        contextWindow: 128_000,
+        maxOutputTokens: 8_192,
+        supportsTools: false,
+        inputCostPer1M: 0.55,
+        outputCostPer1M: 2.19,
+        description:
+            'Deep reasoning — best for complex schema decisions. No tool calling.',
+    },
     // --- LM Studio (local) --------------------------------------------
     // LM Studio runs any GGUF/MLX model the user has downloaded, so we
     // ship a single generic entry. The model id is editable in settings
@@ -151,6 +190,7 @@ export const PROVIDER_LABELS: Record<AIProvider, string> = {
     openai: 'OpenAI',
     anthropic: 'Anthropic',
     gemini: 'Google Gemini',
+    deepseek: 'DeepSeek',
     lmstudio: 'LM Studio (local)',
 };
 
@@ -158,6 +198,7 @@ export const PROVIDER_API_KEY_HINTS: Record<AIProvider, string> = {
     openai: 'Starts with sk-… · platform.openai.com/api-keys',
     anthropic: 'Starts with sk-ant-… · console.anthropic.com/settings/keys',
     gemini: 'Get a key at aistudio.google.com/apikey',
+    deepseek: 'Starts with sk-… · platform.deepseek.com/api_keys',
     lmstudio:
         'Runs on your machine. Optional bearer token if you enabled one in LM Studio Developer settings.',
 };
@@ -165,7 +206,11 @@ export const PROVIDER_API_KEY_HINTS: Record<AIProvider, string> = {
 /** Default base URL for OpenAI-compatible local providers. */
 export const DEFAULT_LMSTUDIO_BASE_URL = 'http://localhost:1234';
 
+/** DeepSeek API base URL. */
+export const DEFAULT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
+
 export const PROVIDER_DEFAULT_BASE_URL: Partial<Record<AIProvider, string>> = {
+    deepseek: DEFAULT_DEEPSEEK_BASE_URL,
     lmstudio: DEFAULT_LMSTUDIO_BASE_URL,
 };
 

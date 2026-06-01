@@ -30,6 +30,24 @@ import { estimateCost, getModel } from './models';
 import { isLocalProvider } from './types';
 import { generateId } from '@/lib/utils/utils';
 
+/** Rough token estimate: ~4 characters per token for English text. */
+function estimateTokens(text: string): number {
+    return Math.ceil(text.length / 4);
+}
+
+/** Estimate tokens in a single message (content blocks serialized). */
+function estimateMessageTokens(msg: AIMessage): number {
+    let chars = 0;
+    for (const block of msg.content) {
+        if (block.type === 'text') chars += block.text.length;
+        else if (block.type === 'tool_use')
+            chars += JSON.stringify(block.args).length + block.name.length;
+        else if (block.type === 'tool_result')
+            chars += JSON.stringify(block.result).length;
+    }
+    return Math.ceil(chars / 4);
+}
+
 export type ChatStatus =
     | 'idle'
     | 'streaming'
@@ -206,6 +224,40 @@ export class ChatSession {
     // Turn loop
     // -------------------------------------------------------------------
 
+    /**
+     * Prune old messages when the conversation approaches the model's
+     * context window. Always keeps the most recent user message and any
+     * tool messages that belong to the same turn. Drops oldest
+     * assistant/user pairs first.
+     */
+    private pruneMessages(): AIMessage[] {
+        const model = getModel(this.opts.model);
+        if (!model) return this.state.messages;
+
+        const contextWindow = model.contextWindow;
+        // Reserve 30% for system prompt + output + tool results overhead.
+        const budget = Math.floor(contextWindow * 0.7);
+        const messages = this.state.messages;
+
+        // Fast path: estimate total and skip if under budget.
+        const systemPrompt = this.opts.getSystemPrompt();
+        let total = estimateTokens(systemPrompt);
+        for (const m of messages) total += estimateMessageTokens(m);
+        if (total <= budget) return messages;
+
+        // Walk backwards, keep the most recent messages that fit.
+        const kept: AIMessage[] = [];
+        let used = 0;
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const cost = estimateMessageTokens(messages[i]);
+            if (used + cost > budget && kept.length > 0) break;
+            used += cost;
+            kept.unshift(messages[i]);
+        }
+
+        return kept;
+    }
+
     private async runTurn(): Promise<void> {
         const apiKey = this.opts.getApiKey() ?? '';
         const localOk = isLocalProvider(this.opts.provider);
@@ -223,6 +275,12 @@ export class ChatSession {
         this.abortController = new AbortController();
         const signal = this.abortController.signal;
         const turnUsage: ChatTurnUsage = { ...EMPTY_USAGE };
+
+        // Prune old messages if approaching context window limit.
+        const pruned = this.pruneMessages();
+        if (pruned.length < this.state.messages.length) {
+            this.setState({ messages: pruned });
+        }
 
         this.setState({ isBusy: true, status: 'streaming', error: null });
 

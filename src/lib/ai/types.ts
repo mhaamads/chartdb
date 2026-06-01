@@ -18,6 +18,7 @@ export const AI_PROVIDERS = [
     'openai',
     'anthropic',
     'gemini',
+    'deepseek',
     'lmstudio',
 ] as const;
 export type AIProvider = (typeof AI_PROVIDERS)[number];
