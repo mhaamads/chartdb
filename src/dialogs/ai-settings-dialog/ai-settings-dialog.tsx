@@ -959,6 +959,12 @@ async function pingProvider(
                 });
                 break;
             }
+            case 'deepseek':
+                res = await fetch('https://api.deepseek.com/v1/models', {
+                    headers: { Authorization: `Bearer ${key}` },
+                    signal: controller.signal,
+                });
+                break;
         }
         if (!res.ok) {
             const detail = await safeReadText(res);

@@ -39,6 +39,9 @@ spec/
 *.DS_Store
 *.log
 *.lock
+
+# But allow the bun lockfile needed for installs
+!bun.lockb
 *.tmp
 
 # Ignore coverage output
