@@ -213,6 +213,64 @@ export const addNoteArgs = z
     })
     .describe('Add a sticky note to the canvas.');
 
+const contextNoteInput = z
+    .object({
+        areaId: z
+            .string()
+            .min(1)
+            .optional()
+            .describe('Existing module area id.'),
+        tableId: tableIdField.optional(),
+        content: z
+            .string()
+            .min(1)
+            .max(10000)
+            .optional()
+            .describe(
+                'Complete AI-generated Markdown note. Omit only when context is provided.'
+            ),
+        context: z
+            .string()
+            .min(1)
+            .max(4000)
+            .optional()
+            .describe(
+                'Context to turn into a concise note when content is omitted.'
+            ),
+        placement: z
+            .enum(['inside', 'next_to'])
+            .optional()
+            .describe('Place inside the target area or next to it.'),
+        position: positionField,
+        color: hexColorField,
+    })
+    .describe('One note linked by position to an existing area or table.');
+
+export const addContextNotesArgs = z
+    .object({
+        notes: z
+            .array(contextNoteInput)
+            .min(1)
+            .max(100)
+            .describe('Notes to create, one per table or module target.'),
+        context: z
+            .string()
+            .min(1)
+            .max(4000)
+            .optional()
+            .describe(
+                'Shared user-provided context used when an individual note omits content.'
+            ),
+        placement: z
+            .enum(['inside', 'next_to'])
+            .optional()
+            .default('next_to')
+            .describe('Default placement for notes without their own choice.'),
+    })
+    .describe(
+        'Create validated notes for existing modules or tables. The assistant should generate complete note content from the schema and supplied context before calling this tool.'
+    );
+
 export const addAreaArgs = z
     .object({
         name: z.string().min(1).describe('Area label.'),
@@ -445,6 +503,10 @@ const patchOpSchema = z.discriminatedUnion('op', [
     z.object({
         op: z.literal('add_note'),
         args: addNoteArgs,
+    }),
+    z.object({
+        op: z.literal('add_context_notes'),
+        args: addContextNotesArgs,
     }),
     z.object({
         op: z.literal('add_area'),

@@ -20,6 +20,7 @@ import type {
 import { zodToToolSchema } from './json-schema';
 import {
     addAreaArgs,
+    addContextNotesArgs,
     addFieldArgs,
     addNoteArgs,
     applySchemaPatchArgs,
@@ -56,6 +57,7 @@ import type { Area } from '@/lib/domain/area';
 import { dataTypeMap } from '@/lib/data/data-types/data-types';
 import type { DataType } from '@/lib/data/data-types/data-types';
 import type { DBRelationship } from '@/lib/domain/db-relationship';
+import type { Note } from '@/lib/domain/note';
 import type { DBIndex } from '@/lib/domain/db-index';
 import {
     canFieldsUseGinIndex,
@@ -64,6 +66,7 @@ import {
 import type { DBCheckConstraint } from '@/lib/domain/db-check-constraint';
 import type { DBCustomType } from '@/lib/domain/db-custom-type';
 import { validateCheckConstraintWithDetails } from '@/lib/check-constraints/check-constraints-validator';
+import { colorOptions, defaultAreaColor, defaultNoteColor } from '@/lib/colors';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -82,6 +85,10 @@ class ToolError extends Error {
 
 function fail(message: string, hint?: string): never {
     throw new ToolError(message, hint);
+}
+
+function paletteColor(color: string | undefined, fallback: string): string {
+    return color && colorOptions.includes(color) ? color : fallback;
 }
 
 function resolveTable(ctx: AIToolContext, id: string): DBTable {
@@ -478,11 +485,26 @@ async function executeAddNote(
     args: ReturnType<typeof addNoteArgs.parse>,
     ctx: AIToolContext
 ): Promise<{ id: string }> {
+    const position =
+        args.position ??
+        findNotePosition({
+            base: { x: 0, y: 0 },
+            blockers: [
+                ...ctx.chartdb.notes.map((note) => ({
+                    x: note.x,
+                    y: note.y,
+                    width: note.width,
+                    height: note.height,
+                })),
+                ...ctx.chartdb.tables.map(getTableRect),
+                ...ctx.chartdb.areas.map(getAreaRect),
+            ],
+        });
     const created = await ctx.chartdb.createNote({
         content: args.content,
-        x: args.position?.x ?? 0,
-        y: args.position?.y ?? 0,
-        color: args.color ?? '#fef08a',
+        x: position?.x ?? 0,
+        y: position?.y ?? 0,
+        color: paletteColor(args.color, defaultNoteColor),
     });
     ctx.emitProgress?.('Added note.');
     return { id: created.id };
@@ -496,6 +518,272 @@ const addNoteTool = defineTool(
     executeAddNote
 );
 
+const NOTE_WIDTH = 200;
+const NOTE_HEIGHT = 150;
+const NOTE_GAP = 24;
+
+interface CanvasRect {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+}
+
+function rectanglesOverlap(a: CanvasRect, b: CanvasRect): boolean {
+    return (
+        a.x < b.x + b.width &&
+        a.x + a.width > b.x &&
+        a.y < b.y + b.height &&
+        a.y + a.height > b.y
+    );
+}
+
+function getTableRect(table: DBTable): CanvasRect {
+    const dimensions = getTableDimensions(table);
+    return { x: table.x, y: table.y, ...dimensions };
+}
+
+function getAreaRect(area: Area): CanvasRect {
+    return {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+    };
+}
+
+function findNotePosition({
+    base,
+    blockers,
+    area,
+}: {
+    base: { x: number; y: number };
+    blockers: CanvasRect[];
+    area?: Area;
+}): { x: number; y: number } | null {
+    const areaPadding = 16;
+    const areaHeader = 40;
+    for (let row = 0; row < 20; row++) {
+        for (let column = 0; column < 20; column++) {
+            const candidate = {
+                x: base.x + column * (NOTE_WIDTH + NOTE_GAP),
+                y: base.y + row * (NOTE_HEIGHT + NOTE_GAP),
+                width: NOTE_WIDTH,
+                height: NOTE_HEIGHT,
+            };
+            if (
+                area &&
+                (candidate.x < area.x + areaPadding ||
+                    candidate.y < area.y + areaHeader ||
+                    candidate.x + candidate.width >
+                        area.x + area.width - areaPadding ||
+                    candidate.y + candidate.height >
+                        area.y + area.height - areaPadding)
+            ) {
+                continue;
+            }
+            if (
+                !blockers.some((blocker) =>
+                    rectanglesOverlap(candidate, blocker)
+                )
+            ) {
+                return { x: candidate.x, y: candidate.y };
+            }
+        }
+    }
+    return area ? null : { x: base.x, y: base.y };
+}
+
+function resolveArea(ctx: AIToolContext, id: string): Area {
+    const area = ctx.chartdb.areas.find((item) => item.id === id);
+    if (!area) {
+        fail(
+            `No area with id "${id}".`,
+            'Call list_areas to find current module area ids.'
+        );
+    }
+    return area;
+}
+
+async function executeAddContextNotes(
+    args: ReturnType<typeof addContextNotesArgs.parse>,
+    ctx: AIToolContext
+): Promise<{
+    count: number;
+    notes: Array<{
+        id: string;
+        target: { areaId?: string; tableId?: string };
+        position: { x: number; y: number };
+        placement: 'inside' | 'next_to';
+        content: string;
+    }>;
+}> {
+    const targetIds = new Set<string>();
+    const occupied = ctx.chartdb.notes.map((note) => ({
+        x: note.x,
+        y: note.y,
+        width: note.width,
+        height: note.height,
+    }));
+    const notes: Note[] = [];
+    const resultNotes: Array<{
+        id: string;
+        target: { areaId?: string; tableId?: string };
+        position: { x: number; y: number };
+        placement: 'inside' | 'next_to';
+        content: string;
+    }> = [];
+
+    args.notes.forEach((input, index) => {
+        const hasArea = input.areaId !== undefined;
+        const hasTable = input.tableId !== undefined;
+        if (hasArea === hasTable) {
+            fail(
+                `Note #${index + 1} must target exactly one area or table.`,
+                'Provide areaId for a module note or tableId for a table note, not both.'
+            );
+        }
+
+        const targetKey = hasArea
+            ? `area:${input.areaId}`
+            : `table:${input.tableId}`;
+        if (targetIds.has(targetKey)) {
+            fail(
+                `A note target was repeated: ${targetKey}.`,
+                'Create one note per area or table in this batch.'
+            );
+        }
+        targetIds.add(targetKey);
+
+        const area = hasArea ? resolveArea(ctx, input.areaId!) : undefined;
+        const table = hasTable ? resolveTable(ctx, input.tableId!) : undefined;
+        const placement = input.placement ?? args.placement ?? 'next_to';
+        const context = input.context?.trim() || args.context?.trim();
+        const targetLabel = area
+            ? `Module: ${area.name}`
+            : `Table: ${table!.name}`;
+        const relatedTables = area
+            ? ctx.chartdb.tables
+                  .filter((item) => item.parentAreaId === area.id)
+                  .map((item) => item.name)
+            : [table!.name];
+        const content =
+            input.content?.trim() ||
+            (context
+                ? `## ${targetLabel}\n\n${context}${
+                      relatedTables.length > 0
+                          ? `\n\nTables: ${relatedTables.join(', ')}`
+                          : ''
+                  }`
+                : '');
+        if (!content) {
+            fail(
+                `Note #${index + 1} has no content or context.`,
+                'Generate Markdown content with the AI or provide context for the note.'
+            );
+        }
+
+        const tableRect = table ? getTableRect(table) : undefined;
+        const targetArea =
+            area ??
+            (table?.parentAreaId
+                ? ctx.chartdb.areas.find(
+                      (item) => item.id === table.parentAreaId
+                  )
+                : undefined);
+        const base = area
+            ? placement === 'inside'
+                ? { x: area.x + 16, y: area.y + 40 }
+                : { x: area.x + area.width + NOTE_GAP, y: area.y }
+            : placement === 'inside' && targetArea
+              ? { x: targetArea.x + 16, y: targetArea.y + 40 }
+              : {
+                    x: tableRect!.x + tableRect!.width + NOTE_GAP,
+                    y: tableRect!.y,
+                };
+        const blockers = [
+            ...occupied,
+            ...(area && placement === 'inside'
+                ? ctx.chartdb.tables
+                      .filter((item) => item.parentAreaId === area.id)
+                      .map(getTableRect)
+                : ctx.chartdb.tables.map(getTableRect)),
+            ...(area && placement === 'next_to'
+                ? ctx.chartdb.areas
+                      .filter((item) => item.id !== area.id)
+                      .map(getAreaRect)
+                : []),
+        ];
+        const hasExplicitPosition =
+            input.position?.x !== undefined || input.position?.y !== undefined;
+        let effectivePlacement = placement;
+        let position = hasExplicitPosition
+            ? {
+                  x: input.position?.x ?? base.x,
+                  y: input.position?.y ?? base.y,
+              }
+            : findNotePosition({
+                  base,
+                  blockers,
+                  area: placement === 'inside' ? targetArea : undefined,
+              });
+        if (!position) {
+            effectivePlacement = 'next_to';
+            const fallbackBase = area
+                ? { x: area.x + area.width + NOTE_GAP, y: area.y }
+                : {
+                      x: tableRect!.x + tableRect!.width + NOTE_GAP,
+                      y: tableRect!.y,
+                  };
+            position = findNotePosition({
+                base: fallbackBase,
+                blockers,
+            })!;
+        }
+        const note: Note = {
+            id: generateId(),
+            content,
+            x: position.x,
+            y: position.y,
+            width: NOTE_WIDTH,
+            height: NOTE_HEIGHT,
+            color: paletteColor(
+                input.color,
+                paletteColor(area?.color ?? targetArea?.color, defaultNoteColor)
+            ),
+            order: ctx.chartdb.notes.length + index,
+        };
+        notes.push(note);
+        occupied.push({
+            x: note.x,
+            y: note.y,
+            width: note.width,
+            height: note.height,
+        });
+        resultNotes.push({
+            id: note.id,
+            target: hasArea ? { areaId: area!.id } : { tableId: table!.id },
+            position,
+            placement: effectivePlacement,
+            content,
+        });
+    });
+
+    ctx.signal.throwIfAborted();
+    ctx.assertCanWrite?.();
+    await ctx.chartdb.addNotes(notes);
+    ctx.emitProgress?.(`Added ${notes.length} contextual notes.`);
+    return { count: notes.length, notes: resultNotes };
+}
+
+const addContextNotesTool = defineTool(
+    'add_context_notes',
+    'Add AI-generated or context-generated notes for existing modules or tables, placing them inside or beside their targets.',
+    addContextNotesArgs,
+    {},
+    executeAddContextNotes
+);
+
 async function executeAddArea(
     args: ReturnType<typeof addAreaArgs.parse>,
     ctx: AIToolContext
@@ -506,7 +794,7 @@ async function executeAddArea(
         y: args.position?.y ?? 0,
         width: args.width ?? 400,
         height: args.height ?? 300,
-        color: args.color ?? '#e0e7ff',
+        color: paletteColor(args.color, defaultAreaColor),
     });
     ctx.emitProgress?.(`Added area "${args.name}".`);
     return { id: created.id };
@@ -520,14 +808,7 @@ const addAreaTool = defineTool(
     executeAddArea
 );
 
-const MODULE_AREA_COLORS = [
-    '#dbeafe',
-    '#dcfce7',
-    '#fef3c7',
-    '#fce7f3',
-    '#ede9fe',
-    '#cffafe',
-] as const;
+const MODULE_AREA_COLORS = colorOptions;
 
 async function executeGroupTablesByModule(
     args: ReturnType<typeof groupTablesByModuleArgs.parse>,
@@ -632,9 +913,10 @@ async function executeGroupTablesByModule(
             y,
             width,
             height,
-            color:
-                module.color ??
-                MODULE_AREA_COLORS[moduleIndex % MODULE_AREA_COLORS.length],
+            color: paletteColor(
+                module.color,
+                MODULE_AREA_COLORS[moduleIndex % MODULE_AREA_COLORS.length]
+            ),
             order: ctx.chartdb.areas.length + moduleIndex,
         };
         areas.push(area);
@@ -1107,6 +1389,10 @@ const PATCH_DISPATCH = {
         exec: removeRelationshipTool.execute,
     },
     add_note: { args: addNoteArgs, exec: executeAddNote },
+    add_context_notes: {
+        args: addContextNotesArgs,
+        exec: executeAddContextNotes,
+    },
     add_area: { args: addAreaArgs, exec: executeAddArea },
     group_tables_by_module: {
         args: groupTablesByModuleArgs,
@@ -1220,6 +1506,7 @@ export const AI_TOOLS: AIToolDefinition[] = [
     updateFieldTool,
     createRelationshipTool,
     addNoteTool,
+    addContextNotesTool,
     addAreaTool,
     groupTablesByModuleTool,
     createIndexTool,

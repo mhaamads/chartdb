@@ -5,6 +5,7 @@ import type { ChartDBContext } from '@/context/chartdb-context/chartdb-context';
 import { DatabaseType } from '@/lib/domain/database-type';
 import { DBCustomTypeKind } from '@/lib/domain/db-custom-type';
 import type { DBTable } from '@/lib/domain/db-table';
+import { defaultNoteColor } from '@/lib/colors';
 
 function context(overrides: Partial<ChartDBContext> = {}): AIToolContext {
     return {
@@ -380,7 +381,7 @@ describe('database feature tools', () => {
             y: 20,
             width: 400,
             height: 300,
-            color: '#dbeafe',
+            color: '#8eb7ff',
         };
         expect(
             await run(
@@ -418,7 +419,7 @@ describe('database feature tools', () => {
                     {
                         name: 'Identity',
                         tableIds: ['users'],
-                        color: '#dbeafe',
+                        color: '#8eb7ff',
                     },
                 ],
             },
@@ -434,13 +435,13 @@ describe('database feature tools', () => {
             modules: [
                 expect.objectContaining({
                     name: 'Identity',
-                    color: '#dbeafe',
+                    color: '#8eb7ff',
                     tableIds: ['users'],
                 }),
             ],
         });
         expect(addAreas).toHaveBeenCalledWith([
-            expect.objectContaining({ name: 'Identity', color: '#dbeafe' }),
+            expect.objectContaining({ name: 'Identity', color: '#8eb7ff' }),
         ]);
     });
 
@@ -459,5 +460,84 @@ describe('database feature tools', () => {
             )
         ).rejects.toThrow('more than one module');
         expect(addAreas).not.toHaveBeenCalled();
+    });
+
+    it('adds context-generated notes for areas and tables in one batch', async () => {
+        const area = {
+            id: 'identity-area',
+            name: 'Identity',
+            x: 10,
+            y: 20,
+            width: 400,
+            height: 300,
+            color: '#8eb7ff',
+        };
+        const addNotes = vi.fn();
+        const tableInArea = { ...table, parentAreaId: area.id };
+        const ctx = context({
+            areas: [area],
+            tables: [tableInArea],
+            getTable: () => tableInArea,
+            addNotes,
+        });
+        const result = await run(
+            'add_context_notes',
+            {
+                context: 'Owns sign-in and session data.',
+                placement: 'next_to',
+                notes: [
+                    { areaId: area.id },
+                    { tableId: table.id, content: '## Users\n\nAccount data.' },
+                ],
+            },
+            ctx
+        );
+
+        expect(result).toMatchObject({ count: 2 });
+        expect(addNotes).toHaveBeenCalledWith([
+            expect.objectContaining({
+                content: expect.stringContaining('Owns sign-in'),
+                color: area.color,
+            }),
+            expect.objectContaining({
+                content: '## Users\n\nAccount data.',
+                color: area.color,
+            }),
+        ]);
+        expect(addNotes.mock.calls[0][0][0]).toMatchObject({
+            x: expect.any(Number),
+            y: expect.any(Number),
+            width: 200,
+            height: 150,
+        });
+    });
+
+    it('uses the shared note palette for the legacy add_note fallback', async () => {
+        const createNote = vi.fn(async (attributes) => ({
+            id: 'note',
+            ...attributes,
+        })) as unknown as ChartDBContext['createNote'];
+        await run(
+            'add_note',
+            { content: 'Legacy note' },
+            context({ createNote })
+        );
+        expect(createNote).toHaveBeenCalledWith(
+            expect.objectContaining({ color: defaultNoteColor })
+        );
+    });
+
+    it('rejects context notes without exactly one target before mutation', async () => {
+        const addNotes = vi.fn();
+        await expect(
+            run(
+                'add_context_notes',
+                {
+                    notes: [{ content: 'orphan note' }],
+                },
+                context({ addNotes })
+            )
+        ).rejects.toThrow('exactly one area or table');
+        expect(addNotes).not.toHaveBeenCalled();
     });
 });
