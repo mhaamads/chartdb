@@ -8,6 +8,7 @@ import {
     Undo,
     Scan,
     LayoutGrid,
+    Layers2,
 } from 'lucide-react';
 import { Separator } from '@/components/separator/separator';
 import { ToolbarButton } from './toolbar-button';
@@ -26,6 +27,8 @@ import { useCanvas } from '@/hooks/use-canvas';
 import { cn } from '@/lib/utils';
 import { useDiagramFilter } from '@/context/diagram-filter-context/use-diagram-filter';
 import { useAlert } from '@/context/alert-context/alert-context';
+import { useAIChat } from '@/hooks/use-ai-chat';
+import { useAIChatPanel } from '@/dialogs/ai-chat-panel/use-ai-chat-panel';
 
 const convertToPercentage = (value: number) => `${Math.round(value * 100)}%`;
 
@@ -41,6 +44,8 @@ export const Toolbar: React.FC<ToolbarProps> = ({ readonly }) => {
     const { setShowFilter, reorderTables } = useCanvas();
     const { hasActiveFilter } = useDiagramFilter();
     const { showAlert } = useAlert();
+    const { send, ready, state } = useAIChat();
+    const { setOpen: setAIChatOpen } = useAIChatPanel();
 
     const toggleFilter = useCallback(() => {
         setShowFilter((prev) => !prev);
@@ -86,6 +91,14 @@ export const Toolbar: React.FC<ToolbarProps> = ({ readonly }) => {
             onAction: reorderTables,
         });
     }, [t, showAlert, reorderTables]);
+
+    const groupTablesByModule = useCallback(() => {
+        setAIChatOpen(true);
+        if (!ready || state.isBusy) return;
+        void send(
+            'Group all existing tables by logical business modules. Inspect the current schema and areas first, then use group_tables_by_module with stable table ids. Use concise module titles and default colors, assign each table to at most one module, and change only the visual layout.'
+        );
+    }, [ready, send, setAIChatOpen, state.isBusy]);
 
     return (
         <div className="px-1">
@@ -170,6 +183,24 @@ export const Toolbar: React.FC<ToolbarProps> = ({ readonly }) => {
                     <Separator orientation="vertical" />
                     {!readonly ? (
                         <>
+                            <Tooltip>
+                                <TooltipTrigger asChild>
+                                    <span>
+                                        <ToolbarButton
+                                            onClick={groupTablesByModule}
+                                            disabled={state.isBusy}
+                                        >
+                                            <Layers2 />
+                                        </ToolbarButton>
+                                    </span>
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                    {t('toolbar.group_by_modules', {
+                                        defaultValue: 'Group tables by modules',
+                                    })}
+                                </TooltipContent>
+                            </Tooltip>
+                            <Separator orientation="vertical" />
                             <Tooltip>
                                 <TooltipTrigger asChild>
                                     <span>

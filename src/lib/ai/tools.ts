@@ -31,6 +31,8 @@ import {
     findTablesByNameArgs,
     getSchemaOverviewArgs,
     getTableArgs,
+    groupTablesByModuleArgs,
+    listAreasArgs,
     removeCheckConstraintArgs,
     removeCustomTypeArgs,
     removeFieldArgs,
@@ -49,7 +51,8 @@ import { serializeSchemaCompact } from './system-prompt';
 import { z, type ZodTypeAny } from 'zod';
 import { generateId } from '@/lib/utils/utils';
 import type { DBField } from '@/lib/domain/db-field';
-import type { DBTable } from '@/lib/domain/db-table';
+import { getTableDimensions, type DBTable } from '@/lib/domain/db-table';
+import type { Area } from '@/lib/domain/area';
 import { dataTypeMap } from '@/lib/data/data-types/data-types';
 import type { DataType } from '@/lib/data/data-types/data-types';
 import type { DBRelationship } from '@/lib/domain/db-relationship';
@@ -251,6 +254,30 @@ const findTablesByNameTool = defineTool(
         return ctx.chartdb.tables
             .filter((t) => t.name.toLowerCase().includes(q))
             .map((t) => ({ id: t.id, name: t.name, schema: t.schema ?? null }));
+    }
+);
+
+const listAreasTool = defineTool(
+    'list_areas',
+    'List existing titled colored areas and the table ids assigned to each.',
+    listAreasArgs,
+    { readOnly: true },
+    async (args, ctx) => {
+        const query = (args.query ?? '').trim().toLowerCase();
+        return ctx.chartdb.areas
+            .filter((area) => !query || area.name.toLowerCase().includes(query))
+            .map((area) => ({
+                id: area.id,
+                name: area.name,
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: area.height,
+                color: area.color,
+                tableIds: ctx.chartdb.tables
+                    .filter((table) => table.parentAreaId === area.id)
+                    .map((table) => table.id),
+            }));
     }
 );
 
@@ -491,6 +518,179 @@ const addAreaTool = defineTool(
     addAreaArgs,
     {},
     executeAddArea
+);
+
+const MODULE_AREA_COLORS = [
+    '#dbeafe',
+    '#dcfce7',
+    '#fef3c7',
+    '#fce7f3',
+    '#ede9fe',
+    '#cffafe',
+] as const;
+
+async function executeGroupTablesByModule(
+    args: ReturnType<typeof groupTablesByModuleArgs.parse>,
+    ctx: AIToolContext
+): Promise<{
+    modules: Array<
+        Pick<Area, 'id' | 'name' | 'x' | 'y' | 'width' | 'height' | 'color'> & {
+            tableIds: string[];
+        }
+    >;
+    tableCount: number;
+}> {
+    const assignedTableIds = new Set<string>();
+    const moduleTables = args.modules.map((module) => {
+        const name = module.name.trim();
+        if (!name) fail('Module names cannot be blank.');
+
+        const tables = module.tableIds.map((tableId) => {
+            if (assignedTableIds.has(tableId)) {
+                fail(
+                    `Table "${tableId}" is assigned to more than one module.`,
+                    'Assign each table to one module, or remove the duplicate assignment.'
+                );
+            }
+            const table = resolveTable(ctx, tableId);
+            assignedTableIds.add(tableId);
+            return table;
+        });
+
+        return { ...module, name, tables };
+    });
+
+    ctx.signal.throwIfAborted();
+
+    const gap = args.gap ?? 80;
+    const tableGap = 32;
+    const areaPadding = 32;
+    const areaHeader = 56;
+    const areaBottomPadding = 32;
+    const maxAutoRowWidth = 1800;
+    const currentContentRight = Math.max(
+        0,
+        ...ctx.chartdb.areas.map((area) => area.x + area.width),
+        ...ctx.chartdb.tables.map((table) => {
+            const { width } = getTableDimensions(table);
+            return table.x + width;
+        })
+    );
+    const currentContentBottom = Math.max(
+        0,
+        ...ctx.chartdb.areas.map((area) => area.y + area.height),
+        ...ctx.chartdb.tables.map((table) => {
+            const { height } = getTableDimensions(table);
+            return table.y + height;
+        })
+    );
+    const rowStartX = currentContentRight + gap;
+    let nextX = rowStartX;
+    let nextY = currentContentBottom + gap;
+    let rowHeight = 0;
+    const areas: Area[] = [];
+    const tableUpdates = new Map<
+        string,
+        Pick<DBTable, 'x' | 'y' | 'parentAreaId'>
+    >();
+
+    moduleTables.forEach((module, moduleIndex) => {
+        const dimensions = module.tables.map(getTableDimensions);
+        const maxTableWidth = Math.max(...dimensions.map(({ width }) => width));
+        const maxTableHeight = Math.max(
+            ...dimensions.map(({ height }) => height)
+        );
+        const columns = Math.max(1, Math.ceil(Math.sqrt(module.tables.length)));
+        const rows = Math.ceil(module.tables.length / columns);
+        const cellWidth = maxTableWidth + tableGap;
+        const cellHeight = maxTableHeight + tableGap;
+        const minimumWidth = areaPadding * 2 + columns * cellWidth;
+        const minimumHeight =
+            areaHeader + areaBottomPadding + rows * cellHeight;
+        const width = Math.max(module.width ?? 0, minimumWidth);
+        const height = Math.max(module.height ?? 0, minimumHeight);
+        const hasExplicitX = module.position?.x !== undefined;
+        const hasExplicitY = module.position?.y !== undefined;
+
+        if (
+            !hasExplicitX &&
+            !hasExplicitY &&
+            nextX > rowStartX &&
+            nextX + width > rowStartX + maxAutoRowWidth
+        ) {
+            nextX = rowStartX;
+            nextY += rowHeight + gap;
+            rowHeight = 0;
+        }
+
+        const x = module.position?.x ?? nextX;
+        const y = module.position?.y ?? nextY;
+        const area: Area = {
+            id: generateId(),
+            name: module.name,
+            x,
+            y,
+            width,
+            height,
+            color:
+                module.color ??
+                MODULE_AREA_COLORS[moduleIndex % MODULE_AREA_COLORS.length],
+            order: ctx.chartdb.areas.length + moduleIndex,
+        };
+        areas.push(area);
+
+        module.tables.forEach((table, tableIndex) => {
+            const column = tableIndex % columns;
+            const row = Math.floor(tableIndex / columns);
+            tableUpdates.set(table.id, {
+                x: x + areaPadding + column * cellWidth,
+                y: y + areaHeader + row * cellHeight,
+                parentAreaId: area.id,
+            });
+        });
+
+        nextX = Math.max(nextX, x + width + gap);
+        rowHeight = Math.max(rowHeight, height);
+    });
+
+    ctx.signal.throwIfAborted();
+    ctx.assertCanWrite?.();
+    await ctx.chartdb.addAreas(areas);
+    ctx.signal.throwIfAborted();
+    ctx.assertCanWrite?.();
+    await ctx.chartdb.updateTablesState(
+        (tables) =>
+            tables.map((table) => {
+                const update = tableUpdates.get(table.id);
+                return update ? { ...table, ...update } : table;
+            }),
+        { updateHistory: true }
+    );
+
+    ctx.emitProgress?.(
+        `Grouped ${tableUpdates.size} tables into ${areas.length} modules.`
+    );
+    return {
+        modules: areas.map((area, index) => ({
+            id: area.id,
+            name: area.name,
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: area.height,
+            color: area.color,
+            tableIds: moduleTables[index].tables.map((table) => table.id),
+        })),
+        tableCount: tableUpdates.size,
+    };
+}
+
+const groupTablesByModuleTool = defineTool(
+    'group_tables_by_module',
+    'Create titled colored areas, assign existing tables, and place each module on a readable grid.',
+    groupTablesByModuleArgs,
+    {},
+    executeGroupTablesByModule
 );
 
 // ---------------------------------------------------------------------------
@@ -908,6 +1108,10 @@ const PATCH_DISPATCH = {
     },
     add_note: { args: addNoteArgs, exec: executeAddNote },
     add_area: { args: addAreaArgs, exec: executeAddArea },
+    group_tables_by_module: {
+        args: groupTablesByModuleArgs,
+        exec: executeGroupTablesByModule,
+    },
     create_index: { args: createIndexArgs, exec: executeCreateIndex },
     update_index: { args: updateIndexArgs, exec: executeUpdateIndex },
     remove_index: { args: removeIndexArgs, exec: removeIndexTool.execute },
@@ -1005,6 +1209,7 @@ export const AI_TOOLS: AIToolDefinition[] = [
     getSchemaOverviewTool,
     getTableTool,
     findTablesByNameTool,
+    listAreasTool,
     listDataTypesTool,
     // aggregate before individual writes (we want the model to prefer it)
     applySchemaPatchTool,
@@ -1016,6 +1221,7 @@ export const AI_TOOLS: AIToolDefinition[] = [
     createRelationshipTool,
     addNoteTool,
     addAreaTool,
+    groupTablesByModuleTool,
     createIndexTool,
     updateIndexTool,
     createCheckConstraintTool,

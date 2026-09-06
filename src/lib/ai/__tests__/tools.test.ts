@@ -227,6 +227,11 @@ describe('database feature tools', () => {
         id: 'users',
         name: 'users',
         schema: 'public',
+        x: 0,
+        y: 0,
+        color: '#ffffff',
+        isView: false,
+        createdAt: 0,
         fields: [
             {
                 id: 'id',
@@ -365,5 +370,94 @@ describe('database feature tools', () => {
             )
         ).rejects.toThrow('it is used');
         expect(removeCustomType).not.toHaveBeenCalled();
+    });
+
+    it('lists module areas and groups tables into titled colored areas', async () => {
+        const area = {
+            id: 'identity-area',
+            name: 'Identity',
+            x: 10,
+            y: 20,
+            width: 400,
+            height: 300,
+            color: '#dbeafe',
+        };
+        expect(
+            await run(
+                'list_areas',
+                {},
+                context({
+                    areas: [area],
+                    tables: [{ ...table, parentAreaId: area.id }],
+                })
+            )
+        ).toEqual([
+            expect.objectContaining({
+                id: area.id,
+                name: 'Identity',
+                tableIds: ['users'],
+            }),
+        ]);
+
+        const addAreas = vi.fn();
+        const updateTablesState = vi.fn(
+            async (
+                updateFn: (tables: DBTable[]) => PartialExcept<DBTable, 'id'>[]
+            ) => {
+                expect(updateFn([table])[0]).toMatchObject({
+                    parentAreaId: expect.any(String),
+                    x: expect.any(Number),
+                    y: expect.any(Number),
+                });
+            }
+        ) as unknown as ChartDBContext['updateTablesState'];
+        const result = await run(
+            'group_tables_by_module',
+            {
+                modules: [
+                    {
+                        name: 'Identity',
+                        tableIds: ['users'],
+                        color: '#dbeafe',
+                    },
+                ],
+            },
+            context({
+                getTable: () => table,
+                tables: [table],
+                addAreas,
+                updateTablesState,
+            })
+        );
+        expect(result).toMatchObject({
+            tableCount: 1,
+            modules: [
+                expect.objectContaining({
+                    name: 'Identity',
+                    color: '#dbeafe',
+                    tableIds: ['users'],
+                }),
+            ],
+        });
+        expect(addAreas).toHaveBeenCalledWith([
+            expect.objectContaining({ name: 'Identity', color: '#dbeafe' }),
+        ]);
+    });
+
+    it('rejects assigning one table to multiple modules before mutation', async () => {
+        const addAreas = vi.fn();
+        await expect(
+            run(
+                'group_tables_by_module',
+                {
+                    modules: [
+                        { name: 'Identity', tableIds: ['users'] },
+                        { name: 'Accounts', tableIds: ['users'] },
+                    ],
+                },
+                context({ getTable: () => table, addAreas })
+            )
+        ).rejects.toThrow('more than one module');
+        expect(addAreas).not.toHaveBeenCalled();
     });
 });

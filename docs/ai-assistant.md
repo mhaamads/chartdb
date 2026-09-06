@@ -25,6 +25,8 @@ flowchart LR
 
 `ChatSession` builds a fresh prompt and estimates request size before each model round. It trims complete old user turns from the outgoing request, while retaining visible history. The budget includes the system prompt, tool catalog, output allowance, messages, and Gemini metadata. Known model output limits are enforced. An oversized current turn fails explicitly instead of splitting tool calls from their results.
 
+The canvas toolbar's layers button opens the AI panel and submits a visual-only request to group tables by logical modules. It uses the same validated `group_tables_by_module` tool as normal chat; if no provider is configured, the button opens setup instead.
+
 Adapters translate the shared message format to OpenAI Chat Completions, Anthropic Messages, or Gemini Generate Content. DeepSeek and LM Studio reuse the OpenAI-compatible adapter. SSE events are assembled before any tool runs. Tools execute sequentially; results return to the model until it answers or the round limit is reached.
 
 The separate SQL export path uses the installed Vercel AI SDK to translate SQL between database dialects. It uses environment configuration rather than the chat settings. Same-dialect SQL export remains deterministic.
@@ -48,6 +50,7 @@ The separate SQL export path uses the installed Vercel AI SDK to translate SQL b
 | DeepSeek conversion made optional updates required and removed properties named `nullable` | The sanitizer distinguishes schema keywords from property names and preserves optionality; Zod still enforces the original operation schema. |
 | No way to discover supported data types | New read-only `list_data_types` returns dialect types and existing custom types. Field tools accept custom type IDs. |
 | Indexes, check constraints, and custom types were not actionable | Validated create/update/delete tools now reuse the editor's persisted operations; check expressions use the editor's syntax validator, index methods are checked against the active dialect, and custom type deletion is blocked while fields still reference it. All nine operations are also available in `apply_schema_patch`. |
+| Large diagrams were hard to organize visually | Read-only `list_areas` reports existing titled areas and table membership. `group_tables_by_module` validates table ids and duplicate assignments, creates colored titled areas, sizes them from the real table dimensions, and persists deterministic grid positions and `parentAreaId` values. |
 | Relationship creation required a second update | Relationships are created with their complete properties in one editor mutation. |
 | Primary keys could become nullable | Field creation and updates keep primary keys non-nullable. |
 | Overview flags and table defaults disagreed with implementation | Overview honors positions and defaults to omitting fields; omitted table color uses the editor default. |
@@ -71,12 +74,13 @@ The separate SQL export path uses the installed Vercel AI SDK to translate SQL b
 2. Explicitly set `readOnly: true` only for tools with no mutations. Unmarked tools are treated as writes. Mark destructive tools and keep the session approval policy consistent with batch contents.
 3. Reuse editor mutations so ordinary undo/history/storage behavior applies. Validate referenced IDs first. Return created IDs; never tell the model to invent dependent IDs.
 4. For batch operations, use the same implementation as the standalone tool. Check cancellation and write permission between operations and retain partial results on failure.
-5. Add a regression case for the real failure boundary. The provider tests exercise the catalog through all five adapters; session tests cover approvals, history, limits, and cancellation. A React lifecycle test covers diagram navigation.
-6. Keep prompt examples limited to real available capabilities. Indexes, check constraints, and custom types are supported; SQL execution, shell, and browsing tools remain intentionally out of scope.
+5. Keep visual grouping on the existing area/table mutation path. `list_areas` is read-only; `group_tables_by_module` must validate all ids before creating areas, keep assignments unique, and use returned ids/positions in its result.
+6. Add a regression case for the real failure boundary. The provider tests exercise the catalog through all five adapters; session tests cover approvals, history, limits, and cancellation. A React lifecycle test covers diagram navigation.
+7. Keep prompt examples limited to real available capabilities. Indexes, check constraints, custom types, and module grouping are supported; SQL execution, shell, and browsing tools remain intentionally out of scope.
 
 ## Validation
 
-Final result: 908 tests passed across 118 files; production build and repository-wide lint passed. The build still reports bundle-size warnings.
+Final result: 910 tests passed across 118 files; production build and repository-wide lint passed. The build still reports bundle-size warnings.
 
 ```sh
 npm run build

@@ -125,6 +125,15 @@ export const findTablesByNameArgs = z
     })
     .describe('Search tables by name. Returns id/name pairs.');
 
+export const listAreasArgs = z
+    .object({
+        query: z
+            .string()
+            .optional()
+            .describe('Optional case-insensitive area title filter.'),
+    })
+    .describe('List titled colored areas and the tables assigned to each.');
+
 // ---------------------------------------------------------------------------
 // WRITE TOOLS (non-destructive)
 // ---------------------------------------------------------------------------
@@ -213,6 +222,37 @@ export const addAreaArgs = z
         color: hexColorField,
     })
     .describe('Group tables visually by drawing a labelled area.');
+
+const moduleAreaInput = z
+    .object({
+        name: z.string().min(1).describe('Module title shown on the area.'),
+        tableIds: z
+            .array(tableIdField)
+            .min(1)
+            .describe('Existing table ids assigned to this module.'),
+        position: positionField,
+        width: z.number().positive().optional(),
+        height: z.number().positive().optional(),
+        color: hexColorField,
+    })
+    .describe('One titled, colored module area and its tables.');
+
+export const groupTablesByModuleArgs = z
+    .object({
+        modules: z
+            .array(moduleAreaInput)
+            .min(1)
+            .describe('Modules to create and lay out.'),
+        gap: z
+            .number()
+            .min(0)
+            .max(1000)
+            .optional()
+            .describe('Gap between automatically placed module areas.'),
+    })
+    .describe(
+        'Create titled colored areas, assign existing tables to them, and place each module on a readable grid.'
+    );
 
 // ---------------------------------------------------------------------------
 // DATABASE FEATURES
@@ -409,6 +449,10 @@ const patchOpSchema = z.discriminatedUnion('op', [
     z.object({
         op: z.literal('add_area'),
         args: addAreaArgs,
+    }),
+    z.object({
+        op: z.literal('group_tables_by_module'),
+        args: groupTablesByModuleArgs,
     }),
     z.object({
         op: z.literal('create_index'),
