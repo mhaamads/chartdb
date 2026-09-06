@@ -112,10 +112,10 @@ export const AIConfigProvider: React.FC<React.PropsWithChildren> = ({
         readNumber(K.temperature, 0.2)
     );
     const [maxOutputTokens, setMaxOutputTokensState] = useState<number>(() =>
-        readNumber(K.maxOutputTokens, 4096)
+        readNumber(K.maxOutputTokens, 8192)
     );
     const [maxIterations, setMaxIterationsState] = useState<number>(() =>
-        readNumber(K.maxIterations, 8)
+        readNumber(K.maxIterations, 16)
     );
     const [showCost, setShowCostState] = useState<boolean>(() =>
         readBoolean(K.showCost, true)
@@ -241,8 +241,8 @@ export const AIConfigProvider: React.FC<React.PropsWithChildren> = ({
         setModelByProvider(DEFAULT_MODELS);
         setSafetyModeState('ask');
         setTemperatureState(0.2);
-        setMaxOutputTokensState(4096);
-        setMaxIterationsState(8);
+        setMaxOutputTokensState(8192);
+        setMaxIterationsState(16);
         setShowCostState(true);
     }, []);
 

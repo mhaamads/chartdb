@@ -20,7 +20,7 @@ import type {
     AIMessage,
     AIProvider,
     AIProviderAdapter,
-    AIStreamEvent,
+    AISafetyMode,
     AIToolContext,
     AIToolDefinition,
     AITokenUsage,
@@ -28,6 +28,7 @@ import type {
 } from './types';
 import { estimateCost, getModel } from './models';
 import { isLocalProvider } from './types';
+import { repairToolHistory } from './history';
 import { generateId } from '@/lib/utils/utils';
 
 /** Rough token estimate: ~4 characters per token for English text. */
@@ -41,10 +42,12 @@ function estimateMessageTokens(msg: AIMessage): number {
     for (const block of msg.content) {
         if (block.type === 'text') chars += block.text.length;
         else if (block.type === 'tool_use')
-            chars += JSON.stringify(block.args).length + block.name.length;
+            chars +=
+                JSON.stringify(block.args ?? null).length + block.name.length;
         else if (block.type === 'tool_result')
-            chars += JSON.stringify(block.result).length;
+            chars += JSON.stringify(block.result ?? null).length;
     }
+    chars += JSON.stringify(msg.geminiParts ?? []).length;
     return Math.ceil(chars / 4);
 }
 
@@ -113,6 +116,7 @@ export interface ChatSessionOptions {
     /** Cap on assistant ↔ tool round-trips per user message. */
     maxIterations: number;
     /** Safety mode — controls approval prompts. */
+    getSafetyMode?: () => AISafetyMode;
     requiresApproval: (tool: AIToolDefinition, args: unknown) => boolean;
     /** Called when the session state changes. */
     onChange?: (state: ChatState) => void;
@@ -127,11 +131,12 @@ type Listener = (state: ChatState) => void;
 export class ChatSession {
     private state: ChatState;
     private listeners = new Set<Listener>();
+    private generation = 0;
     private abortController: AbortController | null = null;
 
     constructor(private opts: ChatSessionOptions) {
         this.state = {
-            messages: opts.initialMessages ?? [],
+            messages: repairToolHistory(opts.initialMessages ?? []),
             status: 'idle',
             streaming: null,
             error: null,
@@ -169,6 +174,7 @@ export class ChatSession {
         if (this.state.isBusy) {
             throw new Error('Session is already running.');
         }
+        if (!text.trim()) return;
         const userMessage: AIMessage = {
             id: generateId(),
             role: 'user',
@@ -201,7 +207,9 @@ export class ChatSession {
     }
 
     clear(): void {
-        if (this.state.isBusy) this.abort();
+        this.abort();
+        this.generation++;
+        this.abortController = null;
         this.setState({
             messages: [],
             streaming: null,
@@ -209,11 +217,14 @@ export class ChatSession {
             totalUsage: { ...EMPTY_USAGE },
             lastTurnUsage: null,
             status: 'idle',
+            isBusy: false,
+            pendingApproval: null,
         });
     }
 
     setMessages(messages: AIMessage[]): void {
-        this.setState({ messages });
+        if (this.state.isBusy) throw new Error('Session is already running.');
+        this.setState({ messages: repairToolHistory(messages) });
     }
 
     updateOptions(patch: Partial<ChatSessionOptions>): void {
@@ -230,32 +241,47 @@ export class ChatSession {
      * tool messages that belong to the same turn. Drops oldest
      * assistant/user pairs first.
      */
-    private pruneMessages(): AIMessage[] {
+    private pruneMessages(
+        system: string,
+        tools: AIToolDefinition[]
+    ): AIMessage[] {
         const model = getModel(this.opts.model);
         if (!model) return this.state.messages;
-
-        const contextWindow = model.contextWindow;
-        // Reserve 30% for system prompt + output + tool results overhead.
-        const budget = Math.floor(contextWindow * 0.7);
+        const overhead =
+            estimateTokens(system) +
+            estimateTokens(
+                JSON.stringify(
+                    tools.map(({ name, description, inputSchema }) => ({
+                        name,
+                        description,
+                        inputSchema,
+                    }))
+                )
+            );
+        const budget =
+            Math.floor(model.contextWindow * 0.9) -
+            Math.min(this.opts.maxOutputTokens, model.maxOutputTokens) -
+            overhead;
         const messages = this.state.messages;
-
-        // Fast path: estimate total and skip if under budget.
-        const systemPrompt = this.opts.getSystemPrompt();
-        let total = estimateTokens(systemPrompt);
-        for (const m of messages) total += estimateMessageTokens(m);
-        if (total <= budget) return messages;
-
-        // Walk backwards, keep the most recent messages that fit.
-        const kept: AIMessage[] = [];
-        let used = 0;
-        for (let i = messages.length - 1; i >= 0; i--) {
-            const cost = estimateMessageTokens(messages[i]);
-            if (used + cost > budget && kept.length > 0) break;
-            used += cost;
-            kept.unshift(messages[i]);
+        let used = messages.reduce(
+            (sum, m) => sum + estimateMessageTokens(m),
+            0
+        );
+        let start = 0;
+        while (used > budget) {
+            const next = messages.findIndex(
+                (m, i) => i > start && m.role === 'user'
+            );
+            if (next < 0) {
+                throw new Error(
+                    'The current turn and diagram exceed the model context window. Start a new chat or use a larger-context model.'
+                );
+            }
+            for (let i = start; i < next; i++)
+                used -= estimateMessageTokens(messages[i]);
+            start = next;
         }
-
-        return kept;
+        return messages.slice(start);
     }
 
     private async runTurn(): Promise<void> {
@@ -274,17 +300,25 @@ export class ChatSession {
 
         this.abortController = new AbortController();
         const signal = this.abortController.signal;
+        const generation = this.generation;
         const turnUsage: ChatTurnUsage = { ...EMPTY_USAGE };
-
-        // Prune old messages if approaching context window limit.
-        const pruned = this.pruneMessages();
-        if (pruned.length < this.state.messages.length) {
-            this.setState({ messages: pruned });
-        }
 
         this.setState({ isBusy: true, status: 'streaming', error: null });
 
         try {
+            if (
+                !Number.isSafeInteger(this.opts.maxIterations) ||
+                this.opts.maxIterations < 1 ||
+                !Number.isSafeInteger(this.opts.maxOutputTokens) ||
+                this.opts.maxOutputTokens < 1 ||
+                !Number.isFinite(this.opts.temperature) ||
+                this.opts.temperature < 0 ||
+                this.opts.temperature > 2
+            ) {
+                throw new Error(
+                    'Invalid AI settings. Use positive whole-number token and iteration limits, and a temperature between 0 and 2.'
+                );
+            }
             for (let iter = 0; iter < this.opts.maxIterations; iter++) {
                 if (signal.aborted) break;
 
@@ -293,7 +327,8 @@ export class ChatSession {
                     signal,
                     turnUsage
                 );
-                if (!streaming) break; // error already set
+                if (generation !== this.generation) return;
+                if (!streaming || signal.aborted) break; // error already set
 
                 // Commit the streamed message to history.
                 this.setState({
@@ -312,12 +347,17 @@ export class ChatSession {
                 this.setState({ status: 'executing-tool' });
                 const toolResults: AIContentBlock[] = [];
                 for (const call of toolUses) {
-                    if (signal.aborted) break;
-                    const result = await this.executeTool(call, signal);
+                    const result: AIContentBlock = signal.aborted
+                        ? {
+                              type: 'tool_result',
+                              toolUseId: call.toolUseId,
+                              isError: true,
+                              result: { error: 'Cancelled before execution.' },
+                          }
+                        : await this.executeTool(call, signal);
+                    if (generation !== this.generation) return;
                     toolResults.push(result);
                 }
-                if (signal.aborted) break;
-
                 const toolMessage: AIMessage = {
                     id: generateId(),
                     role: 'tool',
@@ -328,12 +368,26 @@ export class ChatSession {
                     messages: [...this.state.messages, toolMessage],
                     status: 'streaming',
                 });
+                if (!signal.aborted && iter === this.opts.maxIterations - 1) {
+                    this.setState({
+                        status: 'error',
+                        error: {
+                            code: 'invalid_request',
+                            message:
+                                'Tool round limit reached. Completed changes are retained; review them before continuing.',
+                        },
+                    });
+                }
             }
         } catch (err) {
-            if (!signal.aborted) {
+            if (!signal.aborted && generation === this.generation) {
                 this.setState({
                     error: {
-                        code: 'unknown',
+                        code:
+                            err instanceof Error &&
+                            err.message.includes('context window')
+                                ? 'context_length'
+                                : 'unknown',
                         message:
                             err instanceof Error ? err.message : String(err),
                     },
@@ -341,27 +395,30 @@ export class ChatSession {
                 });
             }
         } finally {
-            // Aggregate session usage.
-            const total = this.state.totalUsage;
-            const newTotal: ChatTurnUsage = {
-                inputTokens: total.inputTokens + turnUsage.inputTokens,
-                outputTokens: total.outputTokens + turnUsage.outputTokens,
-                cachedInputTokens:
-                    total.cachedInputTokens + turnUsage.cachedInputTokens,
-                cost: total.cost + turnUsage.cost,
-            };
-            this.setState({
-                isBusy: false,
-                status: signal.aborted
-                    ? 'idle'
-                    : this.state.status === 'error'
-                      ? 'error'
-                      : 'idle',
-                streaming: null,
-                lastTurnUsage: turnUsage,
-                totalUsage: newTotal,
-            });
-            this.abortController = null;
+            if (generation === this.generation) {
+                // Aggregate session usage.
+                const total = this.state.totalUsage;
+                const newTotal: ChatTurnUsage = {
+                    inputTokens: total.inputTokens + turnUsage.inputTokens,
+                    outputTokens: total.outputTokens + turnUsage.outputTokens,
+                    cachedInputTokens:
+                        total.cachedInputTokens + turnUsage.cachedInputTokens,
+                    cost: total.cost + turnUsage.cost,
+                };
+                this.setState({
+                    isBusy: false,
+                    status: signal.aborted
+                        ? 'idle'
+                        : this.state.status === 'error'
+                          ? 'error'
+                          : 'idle',
+                    streaming: null,
+                    pendingApproval: null,
+                    lastTurnUsage: turnUsage,
+                    totalUsage: newTotal,
+                });
+                this.abortController = null;
+            }
         }
     }
 
@@ -388,6 +445,7 @@ export class ChatSession {
         const blocks: AIContentBlock[] = [];
         let currentTextIdx: number | null = null;
         const toolIdxById = new Map<string, number>();
+        const completedTools = new Set<string>();
 
         const commit = (): void => {
             this.setState({
@@ -395,38 +453,41 @@ export class ChatSession {
             });
         };
 
-        let stream: AsyncIterable<AIStreamEvent>;
-        try {
-            stream = this.opts.adapter.stream(
-                {
-                    apiKey,
-                    baseUrl: this.opts.getBaseUrl?.(),
-                    model: this.opts.model,
-                    system: this.opts.getSystemPrompt(),
-                    messages: this.state.messages,
-                    tools: this.opts.tools,
-                    temperature: this.opts.temperature,
-                    maxOutputTokens: this.opts.maxOutputTokens,
-                },
-                signal
-            );
-        } catch (err) {
-            this.setState({
-                error: {
-                    code: 'unknown',
-                    message: err instanceof Error ? err.message : String(err),
-                },
-                status: 'error',
-                streaming: null,
-            });
-            return null;
-        }
+        const system = this.opts.getSystemPrompt();
+        const tools =
+            this.opts.getSafetyMode?.() === 'dry-run'
+                ? this.opts.tools.filter((t) => t.readOnly)
+                : this.opts.tools;
+        const messages = this.pruneMessages(system, tools);
+        const stream = this.opts.adapter.stream(
+            {
+                apiKey,
+                baseUrl: this.opts.getBaseUrl?.(),
+                model: this.opts.model,
+                system,
+                messages,
+                tools,
+                temperature: this.opts.temperature,
+                maxOutputTokens: Math.min(
+                    this.opts.maxOutputTokens,
+                    getModel(this.opts.model)?.maxOutputTokens ??
+                        this.opts.maxOutputTokens
+                ),
+            },
+            signal
+        );
 
         for await (const ev of stream) {
             if (signal.aborted) return null;
             switch (ev.type) {
                 case 'message-start':
                     if (ev.model) draft.model = ev.model;
+                    break;
+                case 'gemini-parts':
+                    draft.geminiParts = [
+                        ...(draft.geminiParts ?? []),
+                        ...ev.parts,
+                    ];
                     break;
                 case 'text-delta': {
                     if (currentTextIdx === null) {
@@ -440,6 +501,10 @@ export class ChatSession {
                     break;
                 }
                 case 'tool-use-start': {
+                    if (toolIdxById.has(ev.toolUseId))
+                        throw new Error(
+                            'Duplicate tool call id received. No tools were executed.'
+                        );
                     currentTextIdx = null;
                     blocks.push({
                         type: 'tool_use',
@@ -459,6 +524,7 @@ export class ChatSession {
                     if (idx !== undefined) {
                         const cur = blocks[idx];
                         if (cur.type === 'tool_use') cur.args = ev.args;
+                        completedTools.add(ev.toolUseId);
                     }
                     commit();
                     break;
@@ -481,7 +547,20 @@ export class ChatSession {
                     break;
                 }
                 case 'message-end':
-                    // Done streaming this assistant turn.
+                    if (ev.stopReason === 'aborted') return null;
+                    if (
+                        !ev.stopReason ||
+                        ev.stopReason === 'max_tokens' ||
+                        ev.stopReason === 'error' ||
+                        completedTools.size !== toolIdxById.size ||
+                        blocks.length === 0
+                    ) {
+                        throw new Error(
+                            ev.stopReason === 'max_tokens'
+                                ? 'The model reached its output limit. No tools from this response were executed. Increase the output limit or request a smaller change.'
+                                : 'The provider returned an incomplete response. No tools from this response were executed.'
+                        );
+                    }
                     return { ...draft, content: blocks };
                 case 'error':
                     this.setState({
@@ -492,7 +571,10 @@ export class ChatSession {
                     return null;
             }
         }
-        return { ...draft, content: blocks };
+        if (signal.aborted) return null;
+        throw new Error(
+            'The response stream ended unexpectedly. No tools from this response were executed.'
+        );
     }
 
     // -------------------------------------------------------------------
@@ -516,31 +598,67 @@ export class ChatSession {
             };
         }
 
-        const baseCtx = this.opts.buildToolContext(signal);
-        const ctx: AIToolContext = {
-            ...baseCtx,
-            signal,
-            requestApproval: this.opts.requiresApproval(tool, call.args)
-                ? (req) => this.requestApproval(req)
-                : undefined,
-        };
-
         try {
+            signal.throwIfAborted();
+            tool.validateArgs?.(call.args);
+            const baseCtx = this.opts.buildToolContext(signal);
+            const assertCanWrite = () => {
+                signal.throwIfAborted();
+                if (this.opts.getSafetyMode?.() === 'dry-run')
+                    throw new Error('Writes are disabled in dry-run mode.');
+                if (baseCtx.chartdb?.readonly)
+                    throw new Error('This diagram is read-only.');
+            };
+            if (!tool.readOnly) assertCanWrite();
+            if (this.opts.requiresApproval(tool, call.args)) {
+                const approved = await this.requestApproval({
+                    toolName: tool.name,
+                    args: call.args,
+                    summary: `Run ${tool.name}`,
+                });
+                if (!approved)
+                    throw new Error(
+                        'User declined the operation. Do not retry it.'
+                    );
+            }
+            signal.throwIfAborted();
+            if (!tool.readOnly) assertCanWrite();
+            const ctx: AIToolContext = {
+                ...baseCtx,
+                get chartdb() {
+                    return baseCtx.chartdb;
+                },
+                signal,
+                assertCanWrite,
+                // Approval is enforced once above for every tool, including batches.
+                requestApproval: undefined,
+            };
+            this.setState({ status: 'executing-tool' });
             const result = await tool.execute(call.args, ctx);
+            // Keep invalid/non-serializable results from poisoning later requests.
+            JSON.stringify(result ?? null);
             return {
                 type: 'tool_result',
                 toolUseId: call.toolUseId,
-                result,
+                result: result ?? null,
+                isError: !!(
+                    result &&
+                    typeof result === 'object' &&
+                    'error' in result
+                ),
             };
         } catch (err) {
-            const error = err as Error & { hint?: string };
+            const error = err as
+                | (Error & { hint?: string; details?: unknown })
+                | null;
             return {
                 type: 'tool_result',
                 toolUseId: call.toolUseId,
                 isError: true,
                 result: {
-                    error: error.message ?? String(err),
-                    hint: error.hint,
+                    error: error?.message ?? String(err),
+                    hint: error?.hint,
+                    details: error?.details,
                 },
             };
         }

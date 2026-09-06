@@ -1,9 +1,45 @@
+import { z } from 'zod';
+import { capChatHistory, repairToolHistory } from './history';
 import type { AIMessage } from './types';
 import type { ChatTurnUsage } from './chat-session';
 
 const KEY_PREFIX = 'chartdb:ai-chat:';
 const SCHEMA_VERSION = 1;
 const MAX_MESSAGES = 200;
+const messageSchema = z
+    .object({
+        id: z.string(),
+        role: z.enum(['user', 'assistant', 'system', 'tool']),
+        createdAt: z.number(),
+        content: z
+            .array(
+                z.discriminatedUnion('type', [
+                    z.object({ type: z.literal('text'), text: z.string() }),
+                    z.object({
+                        type: z.literal('tool_use'),
+                        toolUseId: z.string(),
+                        name: z.string(),
+                        args: z.unknown(),
+                    }),
+                    z.object({
+                        type: z.literal('tool_result'),
+                        toolUseId: z.string(),
+                        result: z.unknown(),
+                        isError: z.boolean().optional(),
+                    }),
+                ])
+            )
+            .min(1),
+        model: z.string().optional(),
+        geminiParts: z.array(z.record(z.unknown())).optional(),
+    })
+    .passthrough();
+const usageSchema = z.object({
+    inputTokens: z.number().nonnegative(),
+    outputTokens: z.number().nonnegative(),
+    cachedInputTokens: z.number().nonnegative(),
+    cost: z.number().nonnegative(),
+});
 
 export interface PersistedChat {
     v: number;
@@ -36,7 +72,12 @@ export function loadChat(diagramId: string): PersistedChat | null {
         const parsed = JSON.parse(raw) as PersistedChat;
         if (parsed.v !== SCHEMA_VERSION) return null;
         if (parsed.diagramId !== diagramId) return null;
-        return parsed;
+        if (
+            !z.array(messageSchema).safeParse(parsed.messages).success ||
+            !usageSchema.safeParse(parsed.totalUsage).success
+        )
+            return null;
+        return { ...parsed, messages: repairToolHistory(parsed.messages) };
     } catch {
         return null;
     }
@@ -52,10 +93,7 @@ export function saveChat(
     if (!store) return;
     try {
         // Cap retained history to keep localStorage bounded.
-        const capped =
-            messages.length > MAX_MESSAGES
-                ? messages.slice(messages.length - MAX_MESSAGES)
-                : messages;
+        const capped = capChatHistory(messages, MAX_MESSAGES);
         const data: PersistedChat = {
             v: SCHEMA_VERSION,
             diagramId,

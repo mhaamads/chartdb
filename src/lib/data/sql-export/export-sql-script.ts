@@ -780,12 +780,12 @@ export const exportSQL = async (
         LLM_MODEL_NAME ??
         'gpt-4o-mini-2024-07-18';
 
-    let config: { apiKey: string; baseUrl?: string };
+    let config: { apiKey: string; baseURL?: string };
 
     if (useCustomEndpoint) {
         config = {
             apiKey: apiKey,
-            baseUrl: baseUrl,
+            baseURL: baseUrl,
         };
     } else {
         config = {
@@ -800,8 +800,11 @@ export const exportSQL = async (
     try {
         if (options?.stream) {
             const { textStream, text: textPromise } = await streamText({
-                model: openai(modelName),
+                model: useCustomEndpoint
+                    ? openai.chat(modelName)
+                    : openai(modelName),
                 prompt: prompt,
+                abortSignal: options.signal,
             });
 
             for await (const textPart of textStream) {
@@ -818,13 +821,17 @@ export const exportSQL = async (
         }
 
         const { text } = await generateText({
-            model: openai(modelName),
+            model: useCustomEndpoint
+                ? openai.chat(modelName)
+                : openai(modelName),
             prompt: prompt,
+            abortSignal: options?.signal,
         });
 
         setInCache(cacheKey, text);
         return text;
     } catch (error: unknown) {
+        if (options?.signal?.aborted) return '';
         console.error('Error generating SQL:', error);
         if (error instanceof Error && error.message.includes('API key')) {
             throw new Error(

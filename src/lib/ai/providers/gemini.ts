@@ -8,9 +8,8 @@
  * args like OpenAI/Anthropic). We surface them as a single
  * `tool-use-start` + `tool-use-end` pair with no intermediate deltas.
  *
- * Tool params: Gemini accepts a subset of JSON Schema, but requires `type`
- * lowercased and some keywords stripped (e.g. `additionalProperties`,
- * `$schema`). `cleanGeminiSchema` does that walk.
+ * Tool params use native parametersJsonSchema. Opaque response parts are
+ * replayed unchanged so thought signatures remain attached to their parts.
  */
 
 import type {
@@ -20,14 +19,21 @@ import type {
     AIStopReason,
     AIStreamEvent,
     AIMessage,
-    AIToolJSONSchema,
 } from '../types';
 import { parseJSONSafe, parseSSE } from '../sse';
+import { fetchAIResponse } from '../http';
 
 interface GeminiPart {
     text?: string;
-    functionCall?: { name: string; args?: Record<string, unknown> };
+    thought?: boolean;
+    thoughtSignature?: string;
+    functionCall?: {
+        id?: string;
+        name: string;
+        args?: Record<string, unknown>;
+    };
     functionResponse?: {
+        id?: string;
         name: string;
         response: Record<string, unknown>;
     };
@@ -39,6 +45,8 @@ interface GeminiContent {
 }
 
 interface GeminiChunk {
+    error?: { message?: string };
+    promptFeedback?: { blockReason?: string };
     candidates?: Array<{
         content?: GeminiContent;
         finishReason?: string;
@@ -46,86 +54,10 @@ interface GeminiChunk {
     usageMetadata?: {
         promptTokenCount?: number;
         candidatesTokenCount?: number;
+        thoughtsTokenCount?: number;
         cachedContentTokenCount?: number;
     };
     modelVersion?: string;
-}
-
-/**
- * Keys that the Gemini Schema object does not support.
- * See: https://ai.google.dev/api/caching#Schema
- *
- * Gemini Schema supports: type, format, title, description, nullable, enum,
- * maxItems, minItems, properties, required, minProperties, maxProperties,
- * minLength, maxLength, pattern, example, anyOf, propertyOrdering, default,
- * items, minimum, maximum.
- *
- * NOT supported: additionalProperties, $schema, $ref, $id, $defs,
- * exclusiveMinimum, exclusiveMaximum, multipleOf, allOf, not, if/then/else,
- * unevaluatedProperties, definitions.
- */
-const STRIP_KEYWORDS = new Set([
-    '$schema',
-    '$ref',
-    '$id',
-    '$defs',
-    '$anchor',
-    'additionalProperties',
-    'definitions',
-    'examples', // plural — singular 'example' is OK
-    'multipleOf',
-    'unevaluatedProperties',
-    'allOf',
-    'not',
-    'if',
-    'then',
-    'else',
-]);
-
-function cleanGeminiSchema(schema: AIToolJSONSchema): AIToolJSONSchema {
-    if (!schema || typeof schema !== 'object') return schema;
-    if (Array.isArray(schema)) {
-        return schema.map((s) =>
-            cleanGeminiSchema(s as AIToolJSONSchema)
-        ) as unknown as AIToolJSONSchema;
-    }
-    const out: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(schema)) {
-        if (STRIP_KEYWORDS.has(key)) continue;
-
-        // draft-07 number form: exclusiveMinimum: 0 → minimum: 0
-        // Gemini Schema only supports inclusive minimum/maximum.
-        // We accept the slight semantic loosening for tool schemas.
-        if (key === 'exclusiveMinimum') {
-            if (typeof value === 'number') {
-                // Only set if minimum isn't already present or is larger.
-                const existing = out.minimum as number | undefined;
-                out.minimum =
-                    existing !== undefined ? Math.min(existing, value) : value;
-            }
-            // boolean form (draft-4): { minimum: N, exclusiveMinimum: true }
-            // The minimum key is kept separately; just drop this boolean flag.
-            continue;
-        }
-        if (key === 'exclusiveMaximum') {
-            if (typeof value === 'number') {
-                const existing = out.maximum as number | undefined;
-                out.maximum =
-                    existing !== undefined ? Math.max(existing, value) : value;
-            }
-            continue;
-        }
-
-        if (key === 'type' && typeof value === 'string') {
-            // Gemini Schema uses uppercase type names (STRING, NUMBER, …)
-            out.type = value.toUpperCase();
-        } else if (value !== null && typeof value === 'object') {
-            out[key] = cleanGeminiSchema(value as AIToolJSONSchema);
-        } else {
-            out[key] = value;
-        }
-    }
-    return out as AIToolJSONSchema;
 }
 
 function mapMessages(messages: AIMessage[]): GeminiContent[] {
@@ -140,10 +72,20 @@ function mapMessages(messages: AIMessage[]): GeminiContent[] {
                 )
                 .map((b) => ({
                     functionResponse: {
-                        // Gemini matches by name, not id.
                         name: extractToolNameFromHistory(messages, b.toolUseId),
+                        ...(messages.some((m) =>
+                            m.geminiParts?.some(
+                                (p) =>
+                                    (p as GeminiPart).functionCall?.id ===
+                                    b.toolUseId
+                            )
+                        )
+                            ? { id: b.toolUseId }
+                            : {}),
                         response:
-                            b.result && typeof b.result === 'object'
+                            b.result &&
+                            typeof b.result === 'object' &&
+                            !Array.isArray(b.result)
                                 ? (b.result as Record<string, unknown>)
                                 : { result: b.result },
                     },
@@ -152,6 +94,13 @@ function mapMessages(messages: AIMessage[]): GeminiContent[] {
             continue;
         }
         if (m.role === 'assistant') {
+            if (m.geminiParts?.length) {
+                out.push({
+                    role: 'model',
+                    parts: m.geminiParts as GeminiPart[],
+                });
+                continue;
+            }
             const parts: GeminiPart[] = [];
             for (const b of m.content) {
                 if (b.type === 'text' && b.text) parts.push({ text: b.text });
@@ -203,9 +152,9 @@ function mapStopReason(raw: string | undefined): AIStopReason {
             return 'max_tokens';
         case 'SAFETY':
         case 'RECITATION':
-            return 'content_filter' as AIStopReason;
+            return 'error';
         default:
-            return 'end_turn';
+            return 'error';
     }
 }
 
@@ -243,7 +192,7 @@ export const geminiAdapter: AIProviderAdapter = {
                               functionDeclarations: req.tools.map((t) => ({
                                   name: t.name,
                                   description: t.description,
-                                  parameters: cleanGeminiSchema(t.inputSchema),
+                                  parametersJsonSchema: t.inputSchema,
                               })),
                           },
                       ]
@@ -252,13 +201,16 @@ export const geminiAdapter: AIProviderAdapter = {
 
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
             req.model
-        )}:streamGenerateContent?alt=sse&key=${encodeURIComponent(req.apiKey)}`;
+        )}:streamGenerateContent?alt=sse`;
 
         let response: Response;
         try {
-            response = await fetch(url, {
+            response = await fetchAIResponse(url, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': req.apiKey,
+                },
                 body: JSON.stringify(body),
                 signal,
             });
@@ -295,7 +247,19 @@ export const geminiAdapter: AIProviderAdapter = {
         try {
             for await (const sse of parseSSE(response, signal)) {
                 const chunk = parseJSONSafe<GeminiChunk>(sse.data);
-                if (!chunk) continue;
+                if (!chunk) throw new Error('Invalid JSON in Gemini stream.');
+                if (chunk.error || chunk.promptFeedback?.blockReason) {
+                    yield {
+                        type: 'error',
+                        error: {
+                            code: chunk.error ? 'server' : 'content_filter',
+                            message:
+                                chunk.error?.message ??
+                                `Gemini blocked the prompt: ${chunk.promptFeedback?.blockReason}`,
+                        },
+                    };
+                    return;
+                }
 
                 if (!startEmitted) {
                     startEmitted = true;
@@ -308,11 +272,17 @@ export const geminiAdapter: AIProviderAdapter = {
 
                 const candidate = chunk.candidates?.[0];
                 const parts = candidate?.content?.parts ?? [];
+                if (parts.length)
+                    yield {
+                        type: 'gemini-parts',
+                        parts: parts as Record<string, unknown>[],
+                    };
                 for (const part of parts) {
+                    if (part.thought) continue;
                     if (typeof part.text === 'string' && part.text) {
                         yield { type: 'text-delta', text: part.text };
                     } else if (part.functionCall) {
-                        const id = crypto.randomUUID();
+                        const id = part.functionCall.id ?? crypto.randomUUID();
                         yield {
                             type: 'tool-use-start',
                             toolUseId: id,
@@ -332,7 +302,8 @@ export const geminiAdapter: AIProviderAdapter = {
                     totalInput =
                         chunk.usageMetadata.promptTokenCount ?? totalInput;
                     totalOutput =
-                        chunk.usageMetadata.candidatesTokenCount ?? totalOutput;
+                        (chunk.usageMetadata.candidatesTokenCount ?? 0) +
+                        (chunk.usageMetadata.thoughtsTokenCount ?? 0);
                     cachedInput =
                         chunk.usageMetadata.cachedContentTokenCount ??
                         cachedInput;
@@ -363,6 +334,19 @@ export const geminiAdapter: AIProviderAdapter = {
                 },
             };
         }
-        yield { type: 'message-end', stopReason };
+        if (signal.aborted)
+            yield { type: 'message-end', stopReason: 'aborted' };
+        else if (!stopReason || stopReason === 'error')
+            yield {
+                type: 'error',
+                error: {
+                    code: stopReason === 'error' ? 'content_filter' : 'network',
+                    message:
+                        stopReason === 'error'
+                            ? 'Gemini could not complete the response (blocked or invalid function call).'
+                            : 'Gemini stream ended without a finish reason. No tools were executed.',
+                },
+            };
+        else yield { type: 'message-end', stopReason };
     },
 };

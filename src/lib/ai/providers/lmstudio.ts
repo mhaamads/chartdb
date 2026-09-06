@@ -27,6 +27,7 @@ import { streamOpenAICompatible } from './openai';
 /** Build a chat completions URL from a (possibly trailing-slashed) base. */
 export function buildLMStudioChatUrl(baseUrl: string | undefined): string {
     const trimmed = (baseUrl ?? DEFAULT_LMSTUDIO_BASE_URL).replace(/\/+$/u, '');
+    if (/\/chat\/completions$/u.test(trimmed)) return trimmed;
     // The base URL may or may not already include `/v1`. Normalize.
     if (/\/v1$/u.test(trimmed)) return `${trimmed}/chat/completions`;
     return `${trimmed}/v1/chat/completions`;
@@ -48,6 +49,7 @@ export const lmStudioAdapter: AIProviderAdapter = {
             // LM Studio includes usage on the last chunk automatically and
             // tolerates the extra param, so request it for parity.
             requestUsage: true,
+            maxTokensField: 'max_tokens',
         });
     },
 };

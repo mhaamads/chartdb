@@ -56,3 +56,42 @@ describe('parseJSONSafe', () => {
         expect(parseJSONSafe('not json')).toBeUndefined();
     });
 });
+
+it('handles byte-split UTF-8 and CRLF without stripping payload spaces', async () => {
+    const bytes = new TextEncoder().encode('data:  مرحبا\r\n\r\ndata:\r\n\r\n');
+    const stream = new ReadableStream({
+        start(controller) {
+            for (const byte of bytes)
+                controller.enqueue(new Uint8Array([byte]));
+            controller.close();
+        },
+    });
+    const out = [];
+    for await (const event of parseSSE(new Response(stream))) out.push(event);
+    expect(out).toEqual([
+        { event: '', data: ' مرحبا' },
+        { event: '', data: '' },
+    ]);
+});
+
+it('discards unterminated events and supports CR-only boundaries', async () => {
+    expect(await collect('data: ok\r\rdata: partial\n')).toEqual([
+        { event: '', data: 'ok' },
+    ]);
+});
+
+it('cancels a stalled read and releases the stream', async () => {
+    let cancelled = false;
+    const controller = new AbortController();
+    const stream = new ReadableStream({
+        cancel() {
+            cancelled = true;
+        },
+    });
+    const parser = parseSSE(new Response(stream), controller.signal);
+    const reading = parser.next();
+    controller.abort();
+    expect(await reading).toMatchObject({ done: true });
+    expect(cancelled).toBe(true);
+    expect(stream.locked).toBe(false);
+});

@@ -23,27 +23,44 @@ import {
     addFieldArgs,
     addNoteArgs,
     applySchemaPatchArgs,
+    createCheckConstraintArgs,
+    createCustomTypeArgs,
+    createIndexArgs,
     createRelationshipArgs,
     createTableArgs,
     findTablesByNameArgs,
     getSchemaOverviewArgs,
     getTableArgs,
+    removeCheckConstraintArgs,
+    removeCustomTypeArgs,
     removeFieldArgs,
+    removeIndexArgs,
     removeRelationshipArgs,
     removeTableArgs,
+    updateCheckConstraintArgs,
+    updateCustomTypeArgs,
     updateFieldArgs,
+    updateIndexArgs,
     updateTableArgs,
     type FieldInput,
     type PatchOp,
 } from './schemas';
 import { serializeSchemaCompact } from './system-prompt';
-import type { ZodTypeAny } from 'zod';
+import { z, type ZodTypeAny } from 'zod';
 import { generateId } from '@/lib/utils/utils';
 import type { DBField } from '@/lib/domain/db-field';
 import type { DBTable } from '@/lib/domain/db-table';
 import { dataTypeMap } from '@/lib/data/data-types/data-types';
 import type { DataType } from '@/lib/data/data-types/data-types';
-import type { Cardinality } from '@/lib/domain/db-relationship';
+import type { DBRelationship } from '@/lib/domain/db-relationship';
+import type { DBIndex } from '@/lib/domain/db-index';
+import {
+    canFieldsUseGinIndex,
+    databaseIndexTypes,
+} from '@/lib/domain/db-index';
+import type { DBCheckConstraint } from '@/lib/domain/db-check-constraint';
+import type { DBCustomType } from '@/lib/domain/db-custom-type';
+import { validateCheckConstraintWithDetails } from '@/lib/check-constraints/check-constraints-validator';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -52,7 +69,8 @@ import type { Cardinality } from '@/lib/domain/db-relationship';
 class ToolError extends Error {
     constructor(
         message: string,
-        public hint?: string
+        public hint?: string,
+        public details?: unknown
     ) {
         super(message);
         this.name = 'ToolError';
@@ -75,9 +93,14 @@ function resolveTable(ctx: AIToolContext, id: string): DBTable {
 }
 
 function resolveDataType(ctx: AIToolContext, typeId: string): DataType {
-    const lookup = dataTypeMap[ctx.chartdb.databaseType];
+    const lookup = [
+        ...dataTypeMap[ctx.chartdb.databaseType],
+        ...ctx.chartdb.customTypes.map((t) => ({ id: t.id, name: t.name })),
+    ];
     const match = lookup.find(
-        (t) => t.id === typeId || t.name.toLowerCase() === typeId.toLowerCase()
+        (t) =>
+            t.id.toLowerCase() === typeId.trim().toLowerCase() ||
+            t.name.toLowerCase() === typeId.trim().toLowerCase()
     );
     if (!match) {
         const sample = lookup
@@ -86,7 +109,7 @@ function resolveDataType(ctx: AIToolContext, typeId: string): DataType {
             .join(', ');
         fail(
             `Unknown data type "${typeId}" for ${ctx.chartdb.databaseType}.`,
-            `Examples valid for this dialect: ${sample}. Use one of those ids.`
+            `Call list_data_types for valid ids, including custom types. Examples: ${sample}.`
         );
     }
     return { id: match.id, name: match.name };
@@ -101,7 +124,7 @@ function buildDBField(ctx: AIToolContext, input: FieldInput): DBField {
         type: dataType,
         primaryKey: isPk,
         unique: input.unique ?? false,
-        nullable: input.nullable ?? !isPk,
+        nullable: isPk ? false : (input.nullable ?? true),
         increment: input.increment ?? null,
         isArray: input.isArray ?? null,
         createdAt: Date.now(),
@@ -121,6 +144,7 @@ async function maybeApproveDestructive(
 ): Promise<void> {
     if (!ctx.requestApproval) return;
     const ok = await ctx.requestApproval({ toolName, args, summary });
+    ctx.signal.throwIfAborted();
     if (!ok) {
         fail(
             'User declined the destructive operation.',
@@ -137,30 +161,42 @@ function defineTool<S extends ZodTypeAny>(
     name: string,
     description: string,
     schema: S,
-    options: { destructive?: boolean },
+    options: { destructive?: boolean; readOnly?: boolean },
     execute: (
         args: ReturnType<S['parse']>,
         ctx: AIToolContext
     ) => Promise<unknown>
 ): AIToolDefinition {
+    const parseArgs = (rawArgs: unknown) => {
+        const parsed = schema.safeParse(rawArgs);
+        if (!parsed.success) {
+            throw new ToolError(
+                `Invalid arguments for ${name}: ${parsed.error.message}`,
+                'Check the tool input_schema and resend with corrected args.'
+            );
+        }
+        return parsed.data as ReturnType<S['parse']>;
+    };
     let cachedSchema: AIToolJSONSchema | null = null;
     return {
         name,
         description,
+        validateArgs: (rawArgs) => {
+            parseArgs(rawArgs);
+        },
         destructive: options.destructive,
+        readOnly: options.readOnly ?? false,
         get inputSchema() {
             cachedSchema ??= zodToToolSchema(schema);
             return cachedSchema;
         },
         execute: async (rawArgs, ctx) => {
-            const parsed = schema.safeParse(rawArgs);
-            if (!parsed.success) {
-                throw new ToolError(
-                    `Invalid arguments for ${name}: ${parsed.error.message}`,
-                    'Check the tool input_schema and resend with corrected args.'
-                );
+            ctx.signal.throwIfAborted();
+            if (!options.readOnly) {
+                ctx.assertCanWrite?.();
+                if (ctx.chartdb.readonly) fail('This diagram is read-only.');
             }
-            return execute(parsed.data as ReturnType<S['parse']>, ctx);
+            return execute(parseArgs(rawArgs), ctx);
         },
     };
 }
@@ -173,10 +209,11 @@ const getSchemaOverviewTool = defineTool(
     'get_schema_overview',
     'Returns a compact JSON view of the diagram (tables, fields, relationships). Call this before making changes.',
     getSchemaOverviewArgs,
-    {},
+    { readOnly: true },
     async (args, ctx) => {
         return serializeSchemaCompact(ctx.chartdb, {
-            includeFields: args.includeFields ?? true,
+            includeFields: args.includeFields ?? false,
+            includePositions: args.includePositions ?? false,
             includeRelationships: args.includeRelationships ?? true,
         });
     }
@@ -186,7 +223,7 @@ const getTableTool = defineTool(
     'get_table',
     'Returns full details for one table including all field properties.',
     getTableArgs,
-    {},
+    { readOnly: true },
     async (args, ctx) => {
         const t = resolveTable(ctx, args.tableId);
         return {
@@ -195,6 +232,8 @@ const getTableTool = defineTool(
             schema: t.schema ?? null,
             comments: t.comments ?? null,
             isView: t.isView,
+            position: { x: t.x, y: t.y },
+            color: t.color,
             fields: t.fields,
             indexes: t.indexes,
             checkConstraints: t.checkConstraints ?? [],
@@ -206,12 +245,40 @@ const findTablesByNameTool = defineTool(
     'find_tables_by_name',
     'Search tables by case-insensitive name substring. Use when the user refers to a table by name.',
     findTablesByNameArgs,
-    {},
+    { readOnly: true },
     async (args, ctx) => {
         const q = args.query.toLowerCase();
         return ctx.chartdb.tables
             .filter((t) => t.name.toLowerCase().includes(q))
             .map((t) => ({ id: t.id, name: t.name, schema: t.schema ?? null }));
+    }
+);
+
+const listDataTypesTool = defineTool(
+    'list_data_types',
+    'List valid data type ids and names for this database, including existing custom types. Use before creating or changing columns when unsure of a type.',
+    z.object({
+        query: z
+            .string()
+            .optional()
+            .describe('Optional case-insensitive name substring.'),
+    }),
+    { readOnly: true },
+    async (args, ctx) => {
+        const query = (args.query ?? '').toLowerCase();
+        return {
+            databaseType: ctx.chartdb.databaseType,
+            types: dataTypeMap[ctx.chartdb.databaseType]
+                .filter(
+                    (t) =>
+                        t.name.toLowerCase().includes(query) ||
+                        t.id.toLowerCase().includes(query)
+                )
+                .map(({ id, name }) => ({ id, name })),
+            customTypes: ctx.chartdb.customTypes.filter((t) =>
+                t.name.toLowerCase().includes(query)
+            ),
+        };
     }
 );
 
@@ -232,7 +299,7 @@ async function executeCreateTable(
         name: args.name,
         schema: args.schema ?? null,
         comments: args.comments ?? null,
-        color: args.color,
+        ...(args.color ? { color: args.color } : {}),
         x: args.position?.x ?? 0,
         y: args.position?.y ?? 0,
         isView: args.isView ?? false,
@@ -322,6 +389,7 @@ async function executeUpdateField(
     if (p.scale !== undefined) patch.scale = p.scale;
     if (p.default !== undefined) patch.default = p.default;
     if (p.comments !== undefined) patch.comments = p.comments;
+    if (patch.primaryKey ?? existing.primaryKey) patch.nullable = false;
     await ctx.chartdb.updateField(args.tableId, args.fieldId, patch);
     ctx.emitProgress?.('Updated field.');
     return { ok: true };
@@ -351,19 +419,22 @@ async function executeCreateRelationship(
             `Field "${args.targetFieldId}" not found on table "${targetTable.name}".`
         );
     }
-    const created = await ctx.chartdb.createRelationship({
+    const created: DBRelationship = {
+        id: generateId(),
+        name:
+            args.name ??
+            `${sourceTable.name}_${sourceTable.fields.find((f) => f.id === args.sourceFieldId)!.name}_fk`,
+        sourceSchema: sourceTable.schema,
+        targetSchema: targetTable.schema,
         sourceTableId: args.sourceTableId,
         sourceFieldId: args.sourceFieldId,
         targetTableId: args.targetTableId,
         targetFieldId: args.targetFieldId,
-    });
-    // Override cardinality + name after creation (chartdb defaults to one-to-many).
-    const patch: Partial<typeof created> = {
-        sourceCardinality: args.sourceCardinality as Cardinality,
-        targetCardinality: args.targetCardinality as Cardinality,
+        sourceCardinality: args.sourceCardinality,
+        targetCardinality: args.targetCardinality,
+        createdAt: Date.now(),
     };
-    if (args.name) patch.name = args.name;
-    await ctx.chartdb.updateRelationship(created.id, patch);
+    await ctx.chartdb.addRelationship(created);
     ctx.emitProgress?.('Created relationship.');
     return { id: created.id, name: args.name ?? created.name };
 }
@@ -420,6 +491,336 @@ const addAreaTool = defineTool(
     addAreaArgs,
     {},
     executeAddArea
+);
+
+// ---------------------------------------------------------------------------
+// DATABASE FEATURES
+// ---------------------------------------------------------------------------
+
+function resolveIndex(
+    ctx: AIToolContext,
+    tableId: string,
+    indexId: string
+): DBIndex {
+    const table = resolveTable(ctx, tableId);
+    const index = table.indexes.find((item) => item.id === indexId);
+    if (!index) fail(`No index "${indexId}" on table "${table.name}".`);
+    return index;
+}
+
+function resolveCheckConstraint(
+    ctx: AIToolContext,
+    tableId: string,
+    constraintId: string
+): DBCheckConstraint {
+    const table = resolveTable(ctx, tableId);
+    const constraint = table.checkConstraints?.find(
+        (item) => item.id === constraintId
+    );
+    if (!constraint)
+        fail(`No check constraint "${constraintId}" on table "${table.name}".`);
+    return constraint;
+}
+
+function resolveCustomType(ctx: AIToolContext, id: string): DBCustomType {
+    const customType =
+        ctx.chartdb.customTypes.find((type) => type.id === id) ??
+        ctx.chartdb.getCustomType?.(id);
+    if (!customType) {
+        fail(
+            `No custom type with id "${id}".`,
+            'Call list_data_types to find current custom type ids.'
+        );
+    }
+    return customType;
+}
+
+function validateIndexFields(table: DBTable, fieldIds: string[]): void {
+    if (new Set(fieldIds).size !== fieldIds.length) {
+        fail('An index cannot contain the same field more than once.');
+    }
+    const fields = new Set(table.fields.map((field) => field.id));
+    const missing = fieldIds.filter((id) => !fields.has(id));
+    if (missing.length > 0) {
+        fail(
+            `Index references unknown field id(s): ${missing.join(', ')}.`,
+            `Call get_table for "${table.name}" and use its field ids.`
+        );
+    }
+}
+
+function validateIndexType(
+    ctx: AIToolContext,
+    table: DBTable,
+    fieldIds: string[],
+    type: DBIndex['type']
+): void {
+    if (!type) return;
+    const supported = databaseIndexTypes[ctx.chartdb.databaseType];
+    if (supported && !supported.includes(type)) {
+        fail(
+            `Index type "${type}" is not supported for ${ctx.chartdb.databaseType}.`,
+            'Omit type to use the database default or call get_schema_overview for the current dialect.'
+        );
+    }
+    if (type === 'gin') {
+        const fields = table.fields.filter((field) =>
+            fieldIds.includes(field.id)
+        );
+        if (!canFieldsUseGinIndex(fields)) {
+            fail(
+                'GIN indexes require array, json, jsonb, tsvector, or hstore fields.'
+            );
+        }
+    }
+}
+
+function validateCheckExpression(expression: string): string {
+    const trimmed = expression.trim();
+    const result = validateCheckConstraintWithDetails(trimmed);
+    if (!result.isValid) {
+        fail(
+            `Invalid check constraint expression: ${result.error ?? 'syntax error'}.`,
+            'Provide a complete SQL boolean expression without the CHECK keyword.'
+        );
+    }
+    return trimmed;
+}
+
+async function executeCreateIndex(
+    args: ReturnType<typeof createIndexArgs.parse>,
+    ctx: AIToolContext
+): Promise<{ id: string; name: string }> {
+    const table = resolveTable(ctx, args.tableId);
+    validateIndexFields(table, args.fieldIds);
+    validateIndexType(ctx, table, args.fieldIds, args.type);
+    const index: DBIndex = {
+        id: generateId(),
+        name: args.name ?? `index_${table.name}_${args.fieldIds.join('_')}`,
+        fieldIds: args.fieldIds,
+        unique: args.isPrimaryKey ? true : (args.unique ?? false),
+        createdAt: Date.now(),
+        type: args.type ?? null,
+        isPrimaryKey: args.isPrimaryKey ?? false,
+        comments: args.comments ?? null,
+    };
+    await ctx.chartdb.addIndex(args.tableId, index);
+    ctx.emitProgress?.(`Created index "${index.name}".`);
+    return { id: index.id, name: index.name };
+}
+
+const createIndexTool = defineTool(
+    'create_index',
+    'Create an index on one or more existing fields.',
+    createIndexArgs,
+    {},
+    executeCreateIndex
+);
+
+async function executeUpdateIndex(
+    args: ReturnType<typeof updateIndexArgs.parse>,
+    ctx: AIToolContext
+): Promise<{ ok: true }> {
+    const table = resolveTable(ctx, args.tableId);
+    const current = resolveIndex(ctx, args.tableId, args.indexId);
+    const patch: Partial<DBIndex> = {};
+    const value = args.patch;
+    if (value.name !== undefined) patch.name = value.name;
+    if (value.fieldIds !== undefined) {
+        validateIndexFields(table, value.fieldIds);
+        patch.fieldIds = value.fieldIds;
+    }
+    if (value.unique !== undefined) patch.unique = value.unique;
+    if (value.type !== undefined) patch.type = value.type;
+    validateIndexType(
+        ctx,
+        table,
+        value.fieldIds ?? current.fieldIds,
+        value.type !== undefined ? value.type : current.type
+    );
+    if (value.isPrimaryKey !== undefined) {
+        patch.isPrimaryKey = value.isPrimaryKey;
+        if (value.isPrimaryKey) patch.unique = true;
+    }
+    if (value.comments !== undefined) patch.comments = value.comments;
+    if (Object.keys(patch).length === 0) fail('Index update is empty.');
+    await ctx.chartdb.updateIndex(args.tableId, current.id, patch);
+    ctx.emitProgress?.(`Updated index "${current.name}".`);
+    return { ok: true };
+}
+
+const updateIndexTool = defineTool(
+    'update_index',
+    'Update an existing index name, fields, uniqueness, method, or comments.',
+    updateIndexArgs,
+    {},
+    executeUpdateIndex
+);
+
+const removeIndexTool = defineTool(
+    'remove_index',
+    'Delete an index. Destructive.',
+    removeIndexArgs,
+    { destructive: true },
+    async (args, ctx) => {
+        const index = resolveIndex(ctx, args.tableId, args.indexId);
+        await maybeApproveDestructive(
+            ctx,
+            'remove_index',
+            args,
+            `Delete index "${index.name}".`
+        );
+        await ctx.chartdb.removeIndex(args.tableId, args.indexId);
+        ctx.emitProgress?.(`Removed index "${index.name}".`);
+        return { ok: true };
+    }
+);
+
+async function executeCreateCheckConstraint(
+    args: ReturnType<typeof createCheckConstraintArgs.parse>,
+    ctx: AIToolContext
+): Promise<{ id: string }> {
+    resolveTable(ctx, args.tableId);
+    const constraint: DBCheckConstraint = {
+        id: generateId(),
+        expression: validateCheckExpression(args.expression),
+        createdAt: Date.now(),
+    };
+    await ctx.chartdb.addCheckConstraint(args.tableId, constraint);
+    ctx.emitProgress?.('Created check constraint.');
+    return { id: constraint.id };
+}
+
+const createCheckConstraintTool = defineTool(
+    'create_check_constraint',
+    'Add a SQL check constraint to an existing table.',
+    createCheckConstraintArgs,
+    {},
+    executeCreateCheckConstraint
+);
+
+async function executeUpdateCheckConstraint(
+    args: ReturnType<typeof updateCheckConstraintArgs.parse>,
+    ctx: AIToolContext
+): Promise<{ ok: true }> {
+    const current = resolveCheckConstraint(
+        ctx,
+        args.tableId,
+        args.constraintId
+    );
+    const patch: Partial<DBCheckConstraint> = {};
+    if (args.patch.expression !== undefined) {
+        patch.expression = validateCheckExpression(args.patch.expression);
+    }
+    if (Object.keys(patch).length === 0) fail('Constraint update is empty.');
+    await ctx.chartdb.updateCheckConstraint(args.tableId, current.id, patch);
+    ctx.emitProgress?.('Updated check constraint.');
+    return { ok: true };
+}
+
+const updateCheckConstraintTool = defineTool(
+    'update_check_constraint',
+    'Update an existing check constraint expression.',
+    updateCheckConstraintArgs,
+    {},
+    executeUpdateCheckConstraint
+);
+
+const removeCheckConstraintTool = defineTool(
+    'remove_check_constraint',
+    'Delete a check constraint. Destructive.',
+    removeCheckConstraintArgs,
+    { destructive: true },
+    async (args, ctx) => {
+        resolveCheckConstraint(ctx, args.tableId, args.constraintId);
+        await maybeApproveDestructive(
+            ctx,
+            'remove_check_constraint',
+            args,
+            'Delete a check constraint.'
+        );
+        await ctx.chartdb.removeCheckConstraint(
+            args.tableId,
+            args.constraintId
+        );
+        ctx.emitProgress?.('Removed check constraint.');
+        return { ok: true };
+    }
+);
+
+async function executeCreateCustomType(
+    args: ReturnType<typeof createCustomTypeArgs.parse>,
+    ctx: AIToolContext
+): Promise<{ id: string; name: string; kind: string }> {
+    const customType = await ctx.chartdb.createCustomType({
+        name: args.name,
+        schema: args.schema ?? null,
+        kind: args.kind,
+        values: args.values ?? null,
+        fields: args.fields ?? null,
+        order: args.order ?? null,
+    });
+    ctx.emitProgress?.(`Created custom type "${customType.name}".`);
+    return {
+        id: customType.id,
+        name: customType.name,
+        kind: customType.kind,
+    };
+}
+
+const createCustomTypeTool = defineTool(
+    'create_custom_type',
+    'Create an enum or composite custom database type.',
+    createCustomTypeArgs,
+    {},
+    executeCreateCustomType
+);
+
+const updateCustomTypeTool = defineTool(
+    'update_custom_type',
+    'Update an existing custom database type.',
+    updateCustomTypeArgs,
+    {},
+    async (args, ctx) => {
+        const current = resolveCustomType(ctx, args.customTypeId);
+        await ctx.chartdb.updateCustomType(args.customTypeId, args.patch);
+        ctx.emitProgress?.(`Updated custom type "${current.name}".`);
+        return { ok: true };
+    }
+);
+
+const removeCustomTypeTool = defineTool(
+    'remove_custom_type',
+    'Delete a custom database type. Destructive.',
+    removeCustomTypeArgs,
+    { destructive: true },
+    async (args, ctx) => {
+        const customType = resolveCustomType(ctx, args.customTypeId);
+        const usage = ctx.chartdb.tables.flatMap((table) =>
+            table.fields
+                .filter(
+                    (field) =>
+                        field.type.id === customType.id ||
+                        field.type.name === customType.name
+                )
+                .map((field) => `${table.name}.${field.name}`)
+        );
+        if (usage.length > 0) {
+            fail(
+                `Cannot remove custom type "${customType.name}"; it is used by ${usage.join(', ')}.`,
+                'Update or remove those fields first.'
+            );
+        }
+        await maybeApproveDestructive(
+            ctx,
+            'remove_custom_type',
+            args,
+            `Delete custom type "${customType.name}".`
+        );
+        await ctx.chartdb.removeCustomType(args.customTypeId);
+        ctx.emitProgress?.(`Removed custom type "${customType.name}".`);
+        return { ok: true };
+    }
 );
 
 // ---------------------------------------------------------------------------
@@ -499,53 +900,51 @@ const PATCH_DISPATCH = {
         args: createRelationshipArgs,
         exec: executeCreateRelationship,
     },
-    remove_table: {
-        args: removeTableArgs,
-        exec: async (
-            args: ReturnType<typeof removeTableArgs.parse>,
-            ctx: AIToolContext
-        ) => {
-            await ctx.chartdb.removeTable(args.tableId);
-            return { ok: true };
-        },
-    },
-    remove_field: {
-        args: removeFieldArgs,
-        exec: async (
-            args: ReturnType<typeof removeFieldArgs.parse>,
-            ctx: AIToolContext
-        ) => {
-            await ctx.chartdb.removeField(args.tableId, args.fieldId);
-            return { ok: true };
-        },
-    },
+    remove_table: { args: removeTableArgs, exec: removeTableTool.execute },
+    remove_field: { args: removeFieldArgs, exec: removeFieldTool.execute },
     remove_relationship: {
         args: removeRelationshipArgs,
-        exec: async (
-            args: ReturnType<typeof removeRelationshipArgs.parse>,
-            ctx: AIToolContext
-        ) => {
-            await ctx.chartdb.removeRelationship(args.relationshipId);
-            return { ok: true };
-        },
+        exec: removeRelationshipTool.execute,
     },
     add_note: { args: addNoteArgs, exec: executeAddNote },
     add_area: { args: addAreaArgs, exec: executeAddArea },
+    create_index: { args: createIndexArgs, exec: executeCreateIndex },
+    update_index: { args: updateIndexArgs, exec: executeUpdateIndex },
+    remove_index: { args: removeIndexArgs, exec: removeIndexTool.execute },
+    create_check_constraint: {
+        args: createCheckConstraintArgs,
+        exec: executeCreateCheckConstraint,
+    },
+    update_check_constraint: {
+        args: updateCheckConstraintArgs,
+        exec: executeUpdateCheckConstraint,
+    },
+    remove_check_constraint: {
+        args: removeCheckConstraintArgs,
+        exec: removeCheckConstraintTool.execute,
+    },
+    create_custom_type: {
+        args: createCustomTypeArgs,
+        exec: executeCreateCustomType,
+    },
+    update_custom_type: {
+        args: updateCustomTypeArgs,
+        exec: updateCustomTypeTool.execute,
+    },
+    remove_custom_type: {
+        args: removeCustomTypeArgs,
+        exec: removeCustomTypeTool.execute,
+    },
 } as const;
 
 const applySchemaPatchTool = defineTool(
     'apply_schema_patch',
-    'Apply a batch of related schema operations as a single approvable unit. Strongly preferred over many individual tool calls for multi-step changes.',
+    'Apply a batch of related schema operations as a single approvable unit. Use only when all referenced ids already exist. Runs sequentially, stops on failure, and does not roll back earlier operations.',
     applySchemaPatchArgs,
     { destructive: true /* approval gated based on contents */ },
     async (args, ctx) => {
         const ops = args.ops as PatchOp[];
-        const destructiveOps = ops.filter(
-            (o) =>
-                o.op === 'remove_table' ||
-                o.op === 'remove_field' ||
-                o.op === 'remove_relationship'
-        );
+        const destructiveOps = ops.filter((o) => o.op.startsWith('remove_'));
         if (destructiveOps.length > 0) {
             await maybeApproveDestructive(
                 ctx,
@@ -559,7 +958,8 @@ const applySchemaPatchTool = defineTool(
             if (ctx.signal.aborted) {
                 throw new ToolError(
                     'Patch aborted by user.',
-                    'Stop the run and ask before continuing.'
+                    'Earlier operations remain applied. Inspect the diagram before continuing.',
+                    { applied: results.length, results, failedIndex: i }
                 );
             }
             const op = ops[i];
@@ -578,6 +978,7 @@ const applySchemaPatchTool = defineTool(
                     a: unknown,
                     c: AIToolContext
                 ) => Promise<unknown>;
+                ctx.assertCanWrite?.();
                 const res = await exec(parsed.data, ctx);
                 results.push({ op: op.op, ok: true, result: res });
             } catch (err) {
@@ -585,7 +986,8 @@ const applySchemaPatchTool = defineTool(
                     err instanceof Error ? err.message : String(err);
                 throw new ToolError(
                     `apply_schema_patch failed at op #${i} (${op.op}): ${message}`,
-                    'Earlier ops in the patch have already been applied. Inspect the diagram before continuing.'
+                    'Earlier ops have already been applied. Use the returned ids and inspect the diagram; retry only unfinished operations.',
+                    { applied: results.length, results, failedIndex: i }
                 );
             }
         }
@@ -603,6 +1005,7 @@ export const AI_TOOLS: AIToolDefinition[] = [
     getSchemaOverviewTool,
     getTableTool,
     findTablesByNameTool,
+    listDataTypesTool,
     // aggregate before individual writes (we want the model to prefer it)
     applySchemaPatchTool,
     // writes
@@ -613,10 +1016,19 @@ export const AI_TOOLS: AIToolDefinition[] = [
     createRelationshipTool,
     addNoteTool,
     addAreaTool,
+    createIndexTool,
+    updateIndexTool,
+    createCheckConstraintTool,
+    updateCheckConstraintTool,
+    createCustomTypeTool,
+    updateCustomTypeTool,
     // destructive
     removeTableTool,
     removeFieldTool,
     removeRelationshipTool,
+    removeIndexTool,
+    removeCheckConstraintTool,
+    removeCustomTypeTool,
 ];
 
 export function getTool(name: string): AIToolDefinition | undefined {

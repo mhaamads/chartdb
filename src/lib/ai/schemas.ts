@@ -13,6 +13,8 @@
  */
 
 import { z } from 'zod';
+import { INDEX_TYPES } from '@/lib/domain/db-index';
+import { DBCustomTypeKind } from '@/lib/domain/db-custom-type';
 
 // ---------------------------------------------------------------------------
 // Primitives
@@ -213,6 +215,132 @@ export const addAreaArgs = z
     .describe('Group tables visually by drawing a labelled area.');
 
 // ---------------------------------------------------------------------------
+// DATABASE FEATURES
+// ---------------------------------------------------------------------------
+
+const indexTypeField = z
+    .enum(INDEX_TYPES)
+    .nullable()
+    .optional()
+    .describe('Dialect-specific index method. Omit for the database default.');
+
+export const createIndexArgs = z
+    .object({
+        tableId: tableIdField,
+        name: optionalString.describe(
+            'Index name. Omit to generate one from the table and fields.'
+        ),
+        fieldIds: z
+            .array(fieldIdField)
+            .min(1)
+            .describe('One or more existing field ids, in index order.'),
+        unique: z.boolean().optional().describe('Default false.'),
+        type: indexTypeField,
+        isPrimaryKey: z
+            .boolean()
+            .optional()
+            .describe('Mark this as the table primary-key index.'),
+        comments: optionalNullableString,
+    })
+    .describe('Add an index to an existing table.');
+
+export const updateIndexArgs = z
+    .object({
+        tableId: tableIdField,
+        indexId: z.string().min(1).describe('Stable id of the index.'),
+        patch: createIndexArgs
+            .omit({ tableId: true })
+            .partial()
+            .describe('Subset of index properties to update.'),
+    })
+    .describe('Update an existing index.');
+
+export const removeIndexArgs = z
+    .object({
+        tableId: tableIdField,
+        indexId: z.string().min(1).describe('Stable id of the index.'),
+    })
+    .describe('Delete an index. Destructive.');
+
+export const createCheckConstraintArgs = z
+    .object({
+        tableId: tableIdField,
+        expression: z
+            .string()
+            .trim()
+            .min(1)
+            .describe('SQL boolean expression, without the CHECK keyword.'),
+    })
+    .describe('Add a check constraint to an existing table.');
+
+export const updateCheckConstraintArgs = z
+    .object({
+        tableId: tableIdField,
+        constraintId: z
+            .string()
+            .min(1)
+            .describe('Stable id of the constraint.'),
+        patch: createCheckConstraintArgs
+            .omit({ tableId: true })
+            .partial()
+            .describe('Subset of constraint properties to update.'),
+    })
+    .describe('Update an existing check constraint.');
+
+export const removeCheckConstraintArgs = z
+    .object({
+        tableId: tableIdField,
+        constraintId: z
+            .string()
+            .min(1)
+            .describe('Stable id of the constraint.'),
+    })
+    .describe('Delete a check constraint. Destructive.');
+
+const customTypeField = z.object({
+    field: z.string().min(1).describe('Composite field name.'),
+    type: z.string().min(1).describe('Database or custom type id/name.'),
+});
+
+export const createCustomTypeArgs = z
+    .object({
+        name: z.string().min(1).describe('Custom type name.'),
+        schema: optionalNullableString.describe('Optional schema/namespace.'),
+        kind: z.nativeEnum(DBCustomTypeKind),
+        values: z
+            .array(z.string().min(1))
+            .optional()
+            .describe('Enum labels. Use for enum types.'),
+        fields: z
+            .array(customTypeField)
+            .optional()
+            .describe('Fields. Use for composite types.'),
+        order: z.number().int().nullable().optional(),
+    })
+    .describe('Create an enum or composite custom database type.');
+
+export const updateCustomTypeArgs = z
+    .object({
+        customTypeId: z
+            .string()
+            .min(1)
+            .describe('Stable id of the custom type.'),
+        patch: createCustomTypeArgs
+            .partial()
+            .describe('Subset of custom type properties to update.'),
+    })
+    .describe('Update an existing custom database type.');
+
+export const removeCustomTypeArgs = z
+    .object({
+        customTypeId: z
+            .string()
+            .min(1)
+            .describe('Stable id of the custom type.'),
+    })
+    .describe('Delete a custom database type. Destructive.');
+
+// ---------------------------------------------------------------------------
 // DESTRUCTIVE TOOLS
 // ---------------------------------------------------------------------------
 
@@ -282,6 +410,42 @@ const patchOpSchema = z.discriminatedUnion('op', [
         op: z.literal('add_area'),
         args: addAreaArgs,
     }),
+    z.object({
+        op: z.literal('create_index'),
+        args: createIndexArgs,
+    }),
+    z.object({
+        op: z.literal('update_index'),
+        args: updateIndexArgs,
+    }),
+    z.object({
+        op: z.literal('remove_index'),
+        args: removeIndexArgs,
+    }),
+    z.object({
+        op: z.literal('create_check_constraint'),
+        args: createCheckConstraintArgs,
+    }),
+    z.object({
+        op: z.literal('update_check_constraint'),
+        args: updateCheckConstraintArgs,
+    }),
+    z.object({
+        op: z.literal('remove_check_constraint'),
+        args: removeCheckConstraintArgs,
+    }),
+    z.object({
+        op: z.literal('create_custom_type'),
+        args: createCustomTypeArgs,
+    }),
+    z.object({
+        op: z.literal('update_custom_type'),
+        args: updateCustomTypeArgs,
+    }),
+    z.object({
+        op: z.literal('remove_custom_type'),
+        args: removeCustomTypeArgs,
+    }),
 ]);
 
 export type PatchOp = z.infer<typeof patchOpSchema>;
@@ -298,7 +462,7 @@ export const applySchemaPatchArgs = z
             .array(patchOpSchema)
             .min(1)
             .describe(
-                'Ordered list of operations. Executed atomically; halts on first error.'
+                'Ordered list of operations. Executed sequentially; halts on first error without rollback. Reference only ids that already exist before this call.'
             ),
     })
     .describe(

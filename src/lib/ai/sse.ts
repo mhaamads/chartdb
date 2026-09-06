@@ -27,41 +27,69 @@ export async function* parseSSE(
     const decoder = new TextDecoder();
     let buffer = '';
     let event = '';
-    let data = '';
-
+    let data: string[] = [];
+    const abort = () => {
+        void reader.cancel().catch(() => {});
+    };
+    signal?.addEventListener('abort', abort, { once: true });
     try {
-        while (true) {
-            if (signal?.aborted) {
-                await reader.cancel();
-                return;
+        while (!signal?.aborted) {
+            let timedOut = false;
+            const timer = setTimeout(() => {
+                timedOut = true;
+                abort();
+            }, 120_000);
+            let chunk: ReadableStreamReadResult<Uint8Array>;
+            try {
+                chunk = await reader.read();
+            } finally {
+                clearTimeout(timer);
             }
-            const { value, done } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            let newlineIndex: number;
-            while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
-                const rawLine = buffer.slice(0, newlineIndex);
-                buffer = buffer.slice(newlineIndex + 1);
-                const line = rawLine.replace(/\r$/u, '');
+            if (timedOut)
+                throw new Error(
+                    'The provider stream was inactive for 120 seconds.'
+                );
+            const { value, done } = chunk;
+            if (signal?.aborted) return;
+            buffer += done
+                ? decoder.decode()
+                : decoder.decode(value, { stream: true });
+            let match: RegExpExecArray | null;
+            while ((match = /[\r\n]/u.exec(buffer))) {
+                const index = match.index;
+                // A CRLF pair may itself span network chunks.
+                if (
+                    !done &&
+                    buffer[index] === '\r' &&
+                    index === buffer.length - 1
+                )
+                    break;
+                const line = buffer.slice(0, index);
+                const width =
+                    buffer[index] === '\r' && buffer[index + 1] === '\n'
+                        ? 2
+                        : 1;
+                buffer = buffer.slice(index + width);
                 if (line === '') {
-                    if (data !== '') {
-                        yield { event, data };
-                    }
+                    if (data.length) yield { event, data: data.join('\n') };
                     event = '';
-                    data = '';
+                    data = [];
                     continue;
                 }
-                if (line.startsWith(':')) continue; // comment
-                if (line.startsWith('event:')) {
-                    event = line.slice(6).trimStart();
-                } else if (line.startsWith('data:')) {
-                    const chunk = line.slice(5).trimStart();
-                    data = data === '' ? chunk : `${data}\n${chunk}`;
-                }
+                if (line.startsWith(':')) continue;
+                const colon = line.indexOf(':');
+                const field = colon < 0 ? line : line.slice(0, colon);
+                const value =
+                    colon < 0 ? '' : line.slice(colon + 1).replace(/^ /u, '');
+                if (field === 'event') event = value;
+                else if (field === 'data') data.push(value);
             }
+            // An event without its blank-line terminator is incomplete.
+            if (done) break;
         }
-        if (data !== '') yield { event, data };
     } finally {
+        signal?.removeEventListener('abort', abort);
+        await reader.cancel().catch(() => {});
         reader.releaseLock();
     }
 }

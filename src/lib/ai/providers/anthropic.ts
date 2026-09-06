@@ -25,6 +25,7 @@ import type {
     AIMessage,
 } from '../types';
 import { parseJSONSafe, parseSSE } from '../sse';
+import { fetchAIResponse } from '../http';
 
 const ANTHROPIC_VERSION = '2023-06-01';
 
@@ -136,7 +137,13 @@ export const anthropicAdapter: AIProviderAdapter = {
             system: req.system,
             messages: mapMessages(req.messages),
             max_tokens: req.maxOutputTokens,
-            temperature: req.temperature,
+            // New Claude models reject sampling overrides; only send to known legacy families.
+            temperature:
+                /^claude-(?:3|(?:sonnet|haiku)-4|opus-4-[56](?:-|$))/u.test(
+                    req.model
+                )
+                    ? Math.min(1, Math.max(0, req.temperature))
+                    : undefined,
             stream: true,
             tools:
                 req.tools.length > 0
@@ -150,17 +157,20 @@ export const anthropicAdapter: AIProviderAdapter = {
 
         let response: Response;
         try {
-            response = await fetch('https://api.anthropic.com/v1/messages', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-api-key': req.apiKey,
-                    'anthropic-version': ANTHROPIC_VERSION,
-                    'anthropic-dangerous-direct-browser-access': 'true',
-                },
-                body: JSON.stringify(body),
-                signal,
-            });
+            response = await fetchAIResponse(
+                'https://api.anthropic.com/v1/messages',
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': req.apiKey,
+                        'anthropic-version': ANTHROPIC_VERSION,
+                        'anthropic-dangerous-direct-browser-access': 'true',
+                    },
+                    body: JSON.stringify(body),
+                    signal,
+                }
+            );
         } catch (err) {
             if (signal.aborted) {
                 yield { type: 'message-end', stopReason: 'aborted' };
@@ -193,7 +203,7 @@ export const anthropicAdapter: AIProviderAdapter = {
         try {
             for await (const sse of parseSSE(response, signal)) {
                 const data = parseJSONSafe<Record<string, unknown>>(sse.data);
-                if (!data) continue;
+                if (!data) throw new Error('Invalid JSON in Anthropic stream.');
 
                 switch (sse.event) {
                     case 'message_start': {
@@ -272,8 +282,10 @@ export const anthropicAdapter: AIProviderAdapter = {
                         const idx = (data.index as number) ?? 0;
                         const state = blocks.get(idx);
                         if (state && state.type === 'tool_use') {
-                            const args =
-                                parseJSONSafe(state.argsBuffer ?? '') ?? {};
+                            const args = state.argsBuffer
+                                ? (parseJSONSafe(state.argsBuffer) ??
+                                  state.argsBuffer)
+                                : {};
                             yield {
                                 type: 'tool-use-end',
                                 toolUseId: state.toolUseId ?? '',
@@ -343,7 +355,16 @@ export const anthropicAdapter: AIProviderAdapter = {
             return;
         }
 
-        // If we exit without `message_stop`:
-        yield { type: 'message-end', stopReason };
+        if (signal.aborted)
+            yield { type: 'message-end', stopReason: 'aborted' };
+        else
+            yield {
+                type: 'error',
+                error: {
+                    code: 'network',
+                    message:
+                        'Anthropic stream ended before message_stop. No tools were executed.',
+                },
+            };
     },
 };

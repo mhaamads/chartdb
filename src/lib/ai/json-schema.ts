@@ -6,8 +6,8 @@
  *   - `type`, `properties`, `required`, `enum`, `items`, `additionalProperties`
  *   - `description`, no `$ref` (providers reject deep refs)
  *
- * We default to `target: 'openApi3'` which inlines refs and is the most
- * forgiving across providers.
+ * Emit JSON Schema 7 (including real null types); provider adapters handle
+ * their own dialect restrictions.
  */
 
 import type { ZodTypeAny } from 'zod';
@@ -16,11 +16,9 @@ import type { AIToolJSONSchema } from './types';
 
 export function zodToToolSchema(schema: ZodTypeAny): AIToolJSONSchema {
     const raw = zodToJsonSchema(schema, {
-        target: 'openApi3',
+        target: 'jsonSchema7',
         $refStrategy: 'none',
     }) as Record<string, unknown>;
-    // The openApi3 target wraps the schema in a top-level object — flatten
-    // it so providers get the exact shape they expect.
     // Strip any draft pointers that some providers reject.
     delete raw.$schema;
     delete raw.definitions;
@@ -28,9 +26,9 @@ export function zodToToolSchema(schema: ZodTypeAny): AIToolJSONSchema {
 }
 
 /**
- * DeepSeek's tool validator rejects `anyOf`/`oneOf`, including the
- * discriminated union used by `apply_schema_patch`. Merge object branches
- * into one permissive object; Zod remains the runtime validator.
+ * Conservative compatibility schema for the existing DeepSeek integration.
+ * Merge object unions into a permissive non-strict shape; Zod still validates
+ * the exact operation. This is not DeepSeek beta strict-mode conversion.
  */
 export function sanitizeDeepSeekToolSchema(
     schema: AIToolJSONSchema
@@ -48,27 +46,81 @@ function sanitizeSchema(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(sanitizeSchema);
     if (!isSchemaObject(value)) return value;
 
-    const unionKey = Array.isArray(value.anyOf)
+    const normalized = Object.fromEntries(
+        Object.entries(value).map(([key, child]) => [
+            key,
+            // Property names are data: a column attribute named "nullable" is
+            // not the OpenAPI nullable keyword and must survive conversion.
+            key === 'properties' && isSchemaObject(child)
+                ? Object.fromEntries(
+                      Object.entries(child).map(([name, schema]) => [
+                          name,
+                          sanitizeSchema(schema),
+                      ])
+                  )
+                : sanitizeSchema(child),
+        ])
+    );
+    const unionKey = Array.isArray(normalized.anyOf)
         ? 'anyOf'
-        : Array.isArray(value.oneOf)
+        : Array.isArray(normalized.oneOf)
           ? 'oneOf'
           : undefined;
-    if (!unionKey) {
-        return Object.fromEntries(
-            Object.entries(value).map(([key, child]) => [
-                key,
-                sanitizeSchema(child),
-            ])
-        );
+    if (!unionKey) return normalizeDeepSeekSchema(normalized);
+    const branches = normalized[unionKey] as unknown[];
+    delete normalized.anyOf;
+    delete normalized.oneOf;
+    return normalizeDeepSeekSchema(mergeSchemaBranches(normalized, branches));
+}
+
+function normalizeDeepSeekSchema(schema: SchemaObject): SchemaObject {
+    const normalized = { ...schema };
+
+    // ponytail: keep the provider schema to DeepSeek's supported subset;
+    // Zod remains the runtime validator for constraints removed here.
+    for (const key of [
+        'nullable',
+        'minLength',
+        'maxLength',
+        'minItems',
+        'maxItems',
+    ]) {
+        delete normalized[key];
     }
 
-    const branches = (value[unionKey] as unknown[]).map(sanitizeSchema);
-    const base = Object.fromEntries(
-        Object.entries(value)
-            .filter(([key]) => key !== 'anyOf' && key !== 'oneOf')
-            .map(([key, child]) => [key, sanitizeSchema(child)])
-    );
-    return mergeSchemaBranches(base, branches);
+    for (const [exclusiveKey, limitKey] of [
+        ['exclusiveMinimum', 'minimum'],
+        ['exclusiveMaximum', 'maximum'],
+    ] as const) {
+        if (normalized[exclusiveKey] === true) {
+            const limit = normalized[limitKey];
+            if (typeof limit === 'number') {
+                normalized[exclusiveKey] = limit;
+                delete normalized[limitKey];
+            } else {
+                delete normalized[exclusiveKey];
+            }
+        } else if (normalized[exclusiveKey] === false) {
+            delete normalized[exclusiveKey];
+        }
+    }
+
+    if (normalized.type === 'object') {
+        const properties = isSchemaObject(normalized.properties)
+            ? normalized.properties
+            : {};
+        normalized.properties = properties;
+        // This adapter uses non-strict mode. Making optional update fields
+        // required makes the model invent unwanted changes.
+        if (Array.isArray(normalized.required)) {
+            normalized.required = normalized.required.filter(
+                (key) => typeof key === 'string' && key in properties
+            );
+        }
+        normalized.additionalProperties = false;
+    }
+
+    return normalized;
 }
 
 function mergeSchemaBranches(
@@ -123,7 +175,7 @@ function mergeSchemaBranches(
         } else if (additionalProperties.some((value) => value === true)) {
             merged.additionalProperties = true;
         }
-        return merged;
+        return normalizeDeepSeekSchema(merged);
     }
 
     const nonNullBranches = branches.filter(
@@ -134,7 +186,7 @@ function mergeSchemaBranches(
             ? { ...base, ...nonNullBranches[0] }
             : base;
         if (nonNullBranches.length < branches.length) merged.nullable = true;
-        return merged;
+        return normalizeDeepSeekSchema(merged);
     }
 
     const types = branches.map((branch) =>
@@ -154,13 +206,13 @@ function mergeSchemaBranches(
         if (enumValues.length > 0) {
             merged.enum = [...new Set(enumValues)];
         }
-        return merged;
+        return normalizeDeepSeekSchema(merged);
     }
 
     // ponytail: heterogeneous unions use the first branch; add an explicit
     // provider schema when a tool needs to preserve multiple primitive types.
-    return {
+    return normalizeDeepSeekSchema({
         ...base,
         ...(isSchemaObject(branches[0]) ? branches[0] : {}),
-    };
+    });
 }

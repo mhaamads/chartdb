@@ -7,9 +7,9 @@
  *   - error handling is uniform across providers.
  *
  * Tool calling: OpenAI splits a single tool call across many `delta` chunks
- * (`tool_calls[i].function.arguments` grows incrementally). We buffer per
- * `index` and emit `tool-use-delta` events for the UI plus a final
- * `tool-use-end` once `finish_reason === 'tool_calls'`.
+ * (`tool_calls[i].function.arguments` grows incrementally). Buffer by index
+ * until the response finishes, so fragmented names and late ids are stable
+ * before publishing a tool call to the session.
  */
 
 import type {
@@ -22,6 +22,7 @@ import type {
 } from '../types';
 import { sanitizeDeepSeekToolSchema } from '../json-schema';
 import { parseJSONSafe, parseSSE } from '../sse';
+import { fetchAIResponse } from '../http';
 
 interface PendingToolCall {
     id: string;
@@ -46,7 +47,8 @@ interface OpenAIChunkChoice {
 interface OpenAIChunk {
     id?: string;
     model?: string;
-    choices: OpenAIChunkChoice[];
+    choices?: OpenAIChunkChoice[];
+    error?: { message?: string; code?: string };
     usage?: {
         prompt_tokens?: number;
         completion_tokens?: number;
@@ -139,7 +141,7 @@ function mapStopReason(raw: string | null | undefined): AIStopReason {
         case 'length':
             return 'max_tokens';
         case 'content_filter':
-            return 'end_turn';
+            return 'error';
         default:
             return 'end_turn';
     }
@@ -183,6 +185,7 @@ export interface OpenAICompatibleConfig {
     thinking?: 'enabled' | 'disabled';
     /** DeepSeek rejects unions such as the `apply_schema_patch` schema. */
     sanitizeToolSchemas?: boolean;
+    omitTemperature?: boolean;
 }
 
 export async function* streamOpenAICompatible(
@@ -194,11 +197,12 @@ export async function* streamOpenAICompatible(
     const body: Record<string, unknown> = {
         model: req.model,
         messages: mapMessages(req.system, req.messages),
-        temperature: req.temperature,
+        temperature: config.omitTemperature ? undefined : req.temperature,
         // OpenAI deprecated `max_tokens` in favour of `max_completion_tokens`.
         // LM Studio accepts both — using the new name keeps us forward-compat.
         [maxTokensField]: req.maxOutputTokens,
         stream: true,
+        parallel_tool_calls: false,
         tools:
             req.tools.length > 0
                 ? req.tools.map((t) => ({
@@ -230,7 +234,7 @@ export async function* streamOpenAICompatible(
 
     let response: Response;
     try {
-        response = await fetch(config.chatCompletionsUrl, {
+        response = await fetchAIResponse(config.chatCompletionsUrl, {
             method: 'POST',
             headers,
             body: JSON.stringify(body),
@@ -268,7 +272,18 @@ export async function* streamOpenAICompatible(
         for await (const sse of parseSSE(response, signal)) {
             if (sse.data === '[DONE]') break;
             const chunk = parseJSONSafe<OpenAIChunk>(sse.data);
-            if (!chunk) continue;
+            if (!chunk) throw new Error('Invalid JSON in provider stream.');
+            if (chunk.error) {
+                yield {
+                    type: 'error',
+                    error: {
+                        code: 'server',
+                        message:
+                            chunk.error.message ?? 'Provider stream error.',
+                    },
+                };
+                return;
+            }
 
             if (!startEmitted) {
                 startEmitted = true;
@@ -281,7 +296,7 @@ export async function* streamOpenAICompatible(
 
             const choice = chunk.choices?.[0];
             if (choice) {
-                const delta = choice.delta;
+                const delta = choice.delta ?? {};
                 if (typeof delta.content === 'string' && delta.content) {
                     yield { type: 'text-delta', text: delta.content };
                 }
@@ -295,32 +310,16 @@ export async function* streamOpenAICompatible(
                                 args: '',
                             };
                             pending.set(tc.index, pendingCall);
-                            if (pendingCall.name) {
-                                yield {
-                                    type: 'tool-use-start',
-                                    toolUseId: pendingCall.id,
-                                    name: pendingCall.name,
-                                };
-                            }
-                        } else if (tc.id && pendingCall.id !== tc.id) {
-                            pendingCall.id = tc.id;
                         }
-                        if (tc.function?.name && !pendingCall.name) {
-                            pendingCall.name = tc.function.name;
-                            yield {
-                                type: 'tool-use-start',
-                                toolUseId: pendingCall.id,
-                                name: pendingCall.name,
-                            };
-                        }
+                        if (tc.id) pendingCall.id = tc.id;
+                        if (tc.function?.name)
+                            pendingCall.name +=
+                                pendingCall.name === tc.function.name
+                                    ? ''
+                                    : tc.function.name;
                         const argDelta = tc.function?.arguments;
                         if (argDelta) {
                             pendingCall.args += argDelta;
-                            yield {
-                                type: 'tool-use-delta',
-                                toolUseId: pendingCall.id,
-                                argsDelta: argDelta,
-                            };
                         }
                     }
                 }
@@ -360,9 +359,46 @@ export async function* streamOpenAICompatible(
         return;
     }
 
+    if (signal.aborted) {
+        yield { type: 'message-end', stopReason: 'aborted' };
+        return;
+    }
+    if (!stopReason) {
+        yield {
+            type: 'error',
+            error: {
+                code: 'network',
+                message:
+                    'The provider stream ended before a finish reason. No tools were executed.',
+            },
+        };
+        return;
+    }
+    if (stopReason === 'error') {
+        yield {
+            type: 'error',
+            error: {
+                code: 'content_filter',
+                message: 'The provider blocked this response.',
+            },
+        };
+        return;
+    }
     // Flush completed tool calls.
     for (const call of pending.values()) {
-        const args = parseJSONSafe(call.args) ?? {};
+        if (!call.name) {
+            yield {
+                type: 'error',
+                error: {
+                    code: 'invalid_request',
+                    message:
+                        'A tool call was missing its name. No tools were executed.',
+                },
+            };
+            return;
+        }
+        yield { type: 'tool-use-start', toolUseId: call.id, name: call.name };
+        const args = parseJSONSafe(call.args) ?? call.args;
         yield { type: 'tool-use-end', toolUseId: call.id, args };
     }
 
@@ -372,7 +408,9 @@ export async function* streamOpenAICompatible(
 export const openAIAdapter: AIProviderAdapter = {
     id: 'openai',
     stream(req, signal) {
+        // Reasoning models reject custom temperature values.
         return streamOpenAICompatible(req, signal, {
+            omitTemperature: /^(o[1-9]|gpt-[5-9])/u.test(req.model),
             chatCompletionsUrl: 'https://api.openai.com/v1/chat/completions',
             requireAuth: true,
             providerLabel: 'OpenAI',

@@ -715,7 +715,7 @@ const BehaviorSection: React.FC = () => {
                     })}
                     help={t('ai_settings.max_iterations_help', {
                         defaultValue:
-                            'Limit on agentic loops to prevent runaway costs.',
+                            'Limit on agentic loops; 16 is a good default for large schema imports.',
                     })}
                     value={maxIterations}
                     onChange={setMaxIterations}

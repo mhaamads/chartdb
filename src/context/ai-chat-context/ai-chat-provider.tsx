@@ -59,9 +59,21 @@ export const AIChatProvider: React.FC<{ children: React.ReactNode }> = ({
     // Session is recreated when the provider, model, or diagram id changes —
     // otherwise we mutate options through `updateOptions` to avoid losing
     // in-flight history.
-    const session = useMemo(() => {
-        if (!ready || !model) return null;
-        if (!apiKey && !isLocalProvider(provider)) return null;
+    const [session, setSession] = useState<ChatSession | null>(null);
+    useEffect(() => {
+        if (!ready || !model || (!apiKey && !isLocalProvider(provider))) {
+            setSession(null);
+            setState((prev) => ({
+                ...prev,
+                messages: [],
+                isBusy: false,
+                status: 'idle',
+                streaming: null,
+                pendingApproval: null,
+                error: null,
+            }));
+            return;
+        }
         const tools = AI_TOOLS;
         const adapter = getAdapter(provider);
         const persisted = loadChat(chartdb.diagramId);
@@ -70,19 +82,25 @@ export const AIChatProvider: React.FC<{ children: React.ReactNode }> = ({
             args: unknown
         ): boolean => {
             const safety = aiConfigRef.current.safetyMode;
-            if (safety === 'dry-run') return true; // never reached for writes — we block in system prompt
+            if (safety === 'dry-run') return false; // runtime blocks writes
             if (safety === 'auto') return false;
             // 'ask' mode
-            if (tool.destructive) return true;
             if (tool.name === 'apply_schema_patch') {
-                // Approval depends on patch contents — tools.ts already gates
-                // destructive ops via requestApproval; for non-destructive
-                // patches we still surface a single confirmation.
+                // Confirm destructive batches and larger groups once.
                 const ops = (args as { ops?: unknown[] })?.ops;
-                if (Array.isArray(ops) && ops.length >= 3) return true;
-                return false;
+                return (
+                    Array.isArray(ops) &&
+                    (ops.length >= 3 ||
+                        ops.some(
+                            (op) =>
+                                !!op &&
+                                typeof op === 'object' &&
+                                'op' in op &&
+                                String(op.op).startsWith('remove_')
+                        ))
+                );
             }
-            return false;
+            return !!tool.destructive;
         };
         const s = new ChatSession({
             provider,
@@ -96,23 +114,42 @@ export const AIChatProvider: React.FC<{ children: React.ReactNode }> = ({
                     databaseType: chartdbRef.current.databaseType,
                     diagramName: chartdbRef.current.diagramName,
                     locale: i18n.language,
-                    schemaSnapshot: serializeSchemaCompact(chartdbRef.current),
+                    // Keep the inline snapshot small for large diagrams. The
+                    // model can request exact fields with get_table.
+                    schemaSnapshot: serializeSchemaCompact(chartdbRef.current, {
+                        includeFields: chartdbRef.current.tables.length <= 30,
+                    }),
                     safetyMode: aiConfigRef.current.safetyMode,
                 }),
-            buildToolContext: () => ({
-                chartdb: chartdbRef.current,
-                diagramId: chartdbRef.current.diagramId,
+            buildToolContext: (signal) => ({
+                get chartdb() {
+                    signal.throwIfAborted();
+                    if (chartdbRef.current.diagramId !== chartdb.diagramId) {
+                        throw new Error(
+                            'The active diagram changed. Start a new turn.'
+                        );
+                    }
+                    return chartdbRef.current;
+                },
+                diagramId: chartdb.diagramId,
             }),
             temperature: aiConfigRef.current.temperature,
             maxOutputTokens: aiConfigRef.current.maxOutputTokens,
             maxIterations: aiConfigRef.current.maxIterations,
             requiresApproval,
-            onChange: setState,
+            getSafetyMode: () => aiConfigRef.current.safetyMode,
             initialMessages: persisted?.messages,
             initialTotalUsage: persisted?.totalUsage,
         });
+        setSession(s);
         setState(s.getState());
-        return s;
+        const unsubscribe = s.subscribe(setState);
+        return () => {
+            unsubscribe();
+            s.abort();
+            const final = s.getState();
+            saveChat(chartdb.diagramId, final.messages, final.totalUsage);
+        };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [provider, model, ready, chartdb.diagramId]);
 
@@ -136,12 +173,12 @@ export const AIChatProvider: React.FC<{ children: React.ReactNode }> = ({
     const diagramId = chartdb.diagramId;
     useEffect(() => {
         if (!session || !diagramId) return;
-        if (state.isBusy) return;
+        if (state !== session.getState() || state.isBusy) return;
         const handle = window.setTimeout(() => {
             saveChat(diagramId, state.messages, state.totalUsage);
         }, 300);
         return () => window.clearTimeout(handle);
-    }, [session, diagramId, state.messages, state.totalUsage, state.isBusy]);
+    }, [session, diagramId, state]);
 
     // Auto-arrange tables when the AI creates or removes tables.
     // Track the table count at the start of each turn; when the turn

@@ -3,9 +3,8 @@
  *
  * All provider-specific SDKs are kept behind the `AIProviderAdapter`
  * interface so the rest of the app never imports an OpenAI / Anthropic /
- * Gemini SDK directly. This keeps bundle splitting easy (each adapter is a
- * dynamic import) and means new providers can be added without touching
- * the UI or executor.
+ * Gemini SDK directly. Small fetch-based adapters translate the wire format
+ * while the UI and executor share one protocol.
  */
 
 import type { ChartDBContext } from '@/context/chartdb-context/chartdb-context';
@@ -91,6 +90,8 @@ export interface AIMessage {
     usage?: AITokenUsage;
     /** Model id that produced this message, if any. */
     model?: string;
+    /** Opaque Gemini response parts, replayed unchanged to preserve signatures. */
+    geminiParts?: Record<string, unknown>[];
 }
 
 export interface AITokenUsage {
@@ -118,6 +119,10 @@ export interface AIToolDefinition {
     inputSchema: AIToolJSONSchema;
     /** True for tools that modify or delete data. Gates approval flow. */
     destructive?: boolean;
+    /** Explicit read-only capability; unmarked tools are treated as writes. */
+    readOnly?: boolean;
+    /** Validate before asking for approval; execute also validates independently. */
+    validateArgs?: (args: unknown) => void;
     /**
      * Execute the tool against the live diagram. The executor wraps this in
      * try/catch and feeds errors back to the model as `tool_result` blocks
@@ -140,6 +145,8 @@ export interface AIToolContext {
      * The executor decides whether to call this based on the safety mode.
      */
     requestApproval?: (summary: ApprovalRequest) => Promise<boolean>;
+    /** Checked again between batch operations. */
+    assertCanWrite?: () => void;
 }
 
 export interface ApprovalRequest {
@@ -155,6 +162,7 @@ export interface ApprovalRequest {
 
 export type AIStreamEvent =
     | { type: 'message-start'; messageId: string; model?: string }
+    | { type: 'gemini-parts'; parts: Record<string, unknown>[] }
     | { type: 'text-delta'; text: string }
     | {
           type: 'tool-use-start';
