@@ -20,6 +20,7 @@ import type {
     AIStreamEvent,
     AIMessage,
 } from '../types';
+import { sanitizeDeepSeekToolSchema } from '../json-schema';
 import { parseJSONSafe, parseSSE } from '../sse';
 
 interface PendingToolCall {
@@ -176,6 +177,12 @@ export interface OpenAICompatibleConfig {
      * chunk — but sending it on OpenAI is required.
      */
     requestUsage: boolean;
+    /** Request field name used for the output-token limit. */
+    maxTokensField?: 'max_tokens' | 'max_completion_tokens';
+    /** Optional thinking-mode override for compatible providers. */
+    thinking?: 'enabled' | 'disabled';
+    /** DeepSeek rejects unions such as the `apply_schema_patch` schema. */
+    sanitizeToolSchemas?: boolean;
 }
 
 export async function* streamOpenAICompatible(
@@ -183,13 +190,14 @@ export async function* streamOpenAICompatible(
     signal: AbortSignal,
     config: OpenAICompatibleConfig
 ): AsyncIterable<AIStreamEvent> {
+    const maxTokensField = config.maxTokensField ?? 'max_completion_tokens';
     const body: Record<string, unknown> = {
         model: req.model,
         messages: mapMessages(req.system, req.messages),
         temperature: req.temperature,
         // OpenAI deprecated `max_tokens` in favour of `max_completion_tokens`.
         // LM Studio accepts both — using the new name keeps us forward-compat.
-        max_completion_tokens: req.maxOutputTokens,
+        [maxTokensField]: req.maxOutputTokens,
         stream: true,
         tools:
             req.tools.length > 0
@@ -198,11 +206,16 @@ export async function* streamOpenAICompatible(
                       function: {
                           name: t.name,
                           description: t.description,
-                          parameters: t.inputSchema,
+                          parameters: config.sanitizeToolSchemas
+                              ? sanitizeDeepSeekToolSchema(t.inputSchema)
+                              : t.inputSchema,
                       },
                   }))
                 : undefined,
     };
+    if (config.thinking) {
+        body.thinking = { type: config.thinking };
+    }
     if (config.requestUsage) {
         body.stream_options = { include_usage: true };
     }

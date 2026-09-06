@@ -112,43 +112,31 @@ export const AI_MODELS: AIModel[] = [
         description: 'Fast tier — best balance of cost and capability.',
     },
     // --- DeepSeek ------------------------------------------------------
-    // DeepSeek API is OpenAI-compatible. Prices are per 1M tokens USD.
+    // DeepSeek API is OpenAI-compatible. Prices are off-peak per 1M tokens;
+    // DeepSeek's current pricing varies between off-peak and peak hours.
     // https://api-docs.deepseek.com/quick_start/pricing
+    {
+        id: 'deepseek-v4-flash',
+        label: 'DeepSeek V4 Flash',
+        provider: 'deepseek',
+        contextWindow: 1_000_000,
+        maxOutputTokens: 384_000,
+        supportsTools: true,
+        inputCostPer1M: 0.22,
+        outputCostPer1M: 0.66,
+        description: 'Fast, affordable latest model with tool calling.',
+    },
     {
         id: 'deepseek-v4-pro',
         label: 'DeepSeek V4 Pro',
         provider: 'deepseek',
         contextWindow: 1_000_000,
-        maxOutputTokens: 128_000,
+        maxOutputTokens: 384_000,
         supportsTools: true,
-        inputCostPer1M: 0.55,
-        outputCostPer1M: 2.19,
-        description:
-            'Latest flagship — strong reasoning, tool use, 1M context.',
+        inputCostPer1M: 0.66,
+        outputCostPer1M: 1.98,
+        description: 'Highest-capability latest model with tool calling.',
         recommended: true,
-    },
-    {
-        id: 'deepseek-chat',
-        label: 'DeepSeek-V3',
-        provider: 'deepseek',
-        contextWindow: 128_000,
-        maxOutputTokens: 8_192,
-        supportsTools: true,
-        inputCostPer1M: 0.27,
-        outputCostPer1M: 1.1,
-        description: 'Fast, affordable general-purpose model.',
-    },
-    {
-        id: 'deepseek-reasoner',
-        label: 'DeepSeek-R1',
-        provider: 'deepseek',
-        contextWindow: 128_000,
-        maxOutputTokens: 8_192,
-        supportsTools: false,
-        inputCostPer1M: 0.55,
-        outputCostPer1M: 2.19,
-        description:
-            'Deep reasoning — best for complex schema decisions. No tool calling.',
     },
     // --- LM Studio (local) --------------------------------------------
     // LM Studio runs any GGUF/MLX model the user has downloaded, so we

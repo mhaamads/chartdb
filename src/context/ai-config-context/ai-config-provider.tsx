@@ -76,7 +76,14 @@ export const AIConfigProvider: React.FC<React.PropsWithChildren> = ({
     >(() =>
         AI_PROVIDERS.reduce(
             (acc, p) => {
-                acc[p] = localStorage.getItem(K.model(p)) || DEFAULT_MODELS[p];
+                const stored = localStorage.getItem(K.model(p));
+                const discontinuedDeepSeekModel =
+                    p === 'deepseek' &&
+                    (stored === 'deepseek-chat' ||
+                        stored === 'deepseek-reasoner');
+                acc[p] = discontinuedDeepSeekModel
+                    ? DEFAULT_MODELS[p]
+                    : stored || DEFAULT_MODELS[p];
                 return acc;
             },
             {} as Record<AIProvider, string>
